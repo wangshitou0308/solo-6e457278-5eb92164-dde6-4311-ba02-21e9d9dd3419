@@ -150,6 +150,77 @@ class HttpApiTests(unittest.TestCase):
         self.assertEqual(rest["events_run"], 1)
         self.assertEqual(rest["results"][0]["verdict"], "HIT")
 
+    def test_swr_sie_and_jobs_over_http(self):
+        # SWR：窗口内返回陈旧副本 + 后台作业随虚拟时钟结算 + 请求合并
+        code, body = call("POST", "/scenarios", {
+            "name": "swr-http",
+            "events": [
+                {"id": "o", "type": "origin", "at": 0, "url": "/feed",
+                 "body": "feed-v1", "etag": '"f1"', "delay": 5,
+                 "headers": {"cache-control":
+                             "max-age=10, stale-while-revalidate=30, "
+                             "stale-if-error=60"}},
+                {"id": "q1", "type": "request", "at": 1, "url": "/feed"},
+                {"id": "q2", "type": "request", "at": 20, "url": "/feed"},
+                {"id": "q3", "type": "request", "at": 21, "url": "/feed"},
+            ],
+        })
+        self.assertEqual(code, 201)
+        sid = body["scenario"]["id"]
+        code, run = call("POST", f"/scenarios/{sid}/run", {})
+        verdicts = [r["verdict"] for r in run["results"] if r["type"] == "request"]
+        self.assertEqual(verdicts,
+                         ["MISS", "STALE_WHILE_REVALIDATE", "STALE_WHILE_REVALIDATE"])
+        c = run["counters"]
+        self.assertEqual(c["background_revalidations"], 1)
+        self.assertEqual(c["coalesced_requests"], 1)
+        self.assertEqual(c["origin_fetches_saved"], 1)
+
+        # 快照：待结算作业可见（finish_at = 20 + delay 5 = 25）
+        code, snap = call("GET", f"/scenarios/{sid}/snapshot?trace=0")
+        self.assertEqual(code, 200)
+        self.assertEqual(len(snap["pending_jobs"]), 1)
+        self.assertEqual(snap["pending_jobs"][0]["finish_at"], 25)
+        self.assertEqual(snap["pending_jobs"][0]["attached"], 1)
+        self.assertEqual(snap["origins"]["/feed"]["delay"], 5)
+
+        # 推进虚拟时钟：作业结算(304)，请求复用结果 HIT；job 结果出现在结果流
+        code, body = call("POST", f"/scenarios/{sid}/events",
+                          {"event": {"id": "q4", "type": "request",
+                                     "at": 30, "url": "/feed"}})
+        code, run = call("POST", f"/scenarios/{sid}/run", {})
+        kinds = [(r["type"], r.get("verdict") or r.get("outcome"))
+                 for r in run["results"]]
+        self.assertIn(("job", "revalidated"), kinds)
+        self.assertIn(("request", "HIT"), kinds)
+
+        # SIE：源站 5xx 时按 stale-if-error 回退陈旧副本
+        # （t=70 已超出 SWR 窗口(25+10+30=65)，但仍在 SIE 窗口(25+10+60=95)内）
+        call("POST", f"/scenarios/{sid}/events",
+             {"events": [
+                 {"id": "boom", "type": "origin_change", "at": 35,
+                  "url": "/feed", "status": 503},
+                 {"id": "q5", "type": "request", "at": 70, "url": "/feed"},
+             ]})
+        code, run = call("POST", f"/scenarios/{sid}/run", {})
+        q5 = [r for r in run["results"] if r.get("event_id") == "q5"][0]
+        self.assertEqual(q5["verdict"], "STALE_IF_ERROR")
+        self.assertEqual(q5["status"], 200)
+        self.assertEqual(run["counters"]["stale_if_error"], 1)
+        self.assertEqual(run["counters"]["origin_errors"], 1)
+
+        # compare 输出包含新统计维度
+        code, body = call("POST", f"/scenarios/{sid}/clone", {"name": "swr-copy"})
+        cid = body["clone"]["id"]
+        call("POST", f"/scenarios/{cid}/run", {})
+        code, cmp = call("POST", "/scenarios/compare", {"ids": [sid, cid]})
+        row = cmp["comparisons"][0]
+        for key in ("delta_stale_served", "delta_stale_while_revalidate",
+                    "delta_stale_if_error", "delta_background_revalidations",
+                    "delta_coalesced_requests", "delta_origin_fetches_saved",
+                    "delta_origin_errors"):
+            self.assertIn(key, row)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

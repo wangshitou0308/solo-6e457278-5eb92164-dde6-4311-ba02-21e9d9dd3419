@@ -12,6 +12,7 @@ from cache_sim.engine import (Engine, DEFAULT_CONFIG, new_state,
                               HIT, MISS, REVALIDATED, REFRESHED,
                               NOT_MODIFIED, UNCACHEABLE, STALE, ERROR,
                               RANGE_HIT, RANGE_FILL, UNSATISFIABLE,
+                              STALE_WHILE_REVALIDATE, STALE_IF_ERROR,
                               parse_range_spec, resolve_range, from_b64)
 from cache_sim.store import Store
 
@@ -782,6 +783,315 @@ class StoreTests(unittest.TestCase):
         self.assertIsNone(self.store.get_state(sid))
         with self.assertRaises(KeyError):
             self.store.get_scenario(sid)
+
+
+class StaleWhileRevalidateTests(unittest.TestCase):
+    CC = "max-age=10, stale-while-revalidate=30"
+
+    def test_swr_serves_stale_then_background_revalidates(self):
+        ev = [
+            origin("o1", 0, etag='"v1"', headers={"cache-control": self.CC}),
+            req("r1", 1),    # MISS，stored_at=1，ttl=10
+            req("r2", 15),   # age=14 陈旧 4s <= 30 -> SWR 陈旧副本 + 后台作业(delay 0)
+            req("r3", 15),   # 同一时刻先结算作业(304) -> 新鲜 -> HIT（复用结果）
+        ]
+        eng, res = run_events({}, ev)
+        self.assertEqual([r["verdict"] for r in res],
+                         [MISS, STALE_WHILE_REVALIDATE, HIT])
+        self.assertIn("warning", res[1]["response_headers"])
+        info = res[1]["stale_info"]
+        self.assertEqual(info["kind"], "stale-while-revalidate")
+        self.assertFalse(info["coalesced"])
+        self.assertEqual(info["job_id"], "job-1")
+        codes = [t["code"] for t in res[1]["trace"]]
+        self.assertIn("SWR_SCHEDULE", codes)
+        self.assertIn("STALE_WHILE_REVALIDATE", codes)
+        c = eng.state["counters"]
+        self.assertEqual(c["background_revalidations"], 1)
+        self.assertEqual(c["jobs_settled"], 1)
+        self.assertEqual(c["stale_while_revalidate"], 1)
+        self.assertEqual(c["revalidations"], 1)
+        self.assertEqual(c["origin_fetches"], 2)   # r1 + 后台作业
+        # 作业结算写入了结果流
+        jobs = [r for r in eng.state["results"] if r.get("type") == "job"]
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(jobs[0]["outcome"], "revalidated")
+
+    def test_swr_coalescing_with_origin_delay(self):
+        ev = [
+            origin("o1", 0, etag='"v1"', delay=5,
+                   headers={"cache-control": self.CC}),
+            req("r1", 1),    # MISS，延迟 5s -> stored_at=6，新鲜到 16
+            req("r2", 20),   # 陈旧 -> SWR，作业 finish_at=25
+            req("r3", 21),   # 作业在途 -> 挂接，返回陈旧副本（合并）
+            req("r4", 26),   # 作业已结算(304) -> HIT
+        ]
+        eng, res = run_events({}, ev)
+        self.assertEqual([r["verdict"] for r in res],
+                         [MISS, STALE_WHILE_REVALIDATE,
+                          STALE_WHILE_REVALIDATE, HIT])
+        self.assertEqual(res[1]["stale_info"]["job_finish_at"], 25)
+        self.assertFalse(res[1]["stale_info"]["coalesced"])
+        self.assertTrue(res[2]["stale_info"]["coalesced"])
+        self.assertEqual(res[1]["stale_info"]["job_id"],
+                         res[2]["stale_info"]["job_id"])
+        codes = [t["code"] for t in res[2]["trace"]]
+        self.assertIn("SWR_COALESCED", codes)
+        c = eng.state["counters"]
+        self.assertEqual(c["coalesced_requests"], 1)
+        self.assertEqual(c["origin_fetches_saved"], 1)
+        self.assertEqual(c["background_revalidations"], 1)
+        self.assertEqual(c["origin_fetches"], 2)   # r1 + 一次合并后的后台重验证
+
+    def test_swr_window_expired_falls_back_to_sync_revalidation(self):
+        ev = [
+            origin("o1", 0, etag='"v1"',
+                   headers={"cache-control": "max-age=10, stale-while-revalidate=5"}),
+            req("r1", 1),
+            req("r2", 20),   # 陈旧 9s > 5s 窗口 -> 同步重验证
+        ]
+        eng, res = run_events({}, ev)
+        self.assertEqual(res[1]["verdict"], REVALIDATED)
+        self.assertEqual(eng.state["jobs"], [])
+        self.assertEqual(eng.state["counters"]["background_revalidations"], 0)
+
+    def test_swr_not_applied_with_must_revalidate(self):
+        ev = [
+            origin("o1", 0, etag='"v1"',
+                   headers={"cache-control":
+                            "max-age=10, must-revalidate, stale-while-revalidate=30"}),
+            req("r1", 1),
+            req("r2", 15),   # must-revalidate 禁止 SWR -> 同步重验证
+        ]
+        eng, res = run_events({}, ev)
+        self.assertEqual(res[1]["verdict"], REVALIDATED)
+        self.assertEqual(eng.state["jobs"], [])
+
+    def test_swr_not_applied_with_request_no_cache(self):
+        ev = [
+            origin("o1", 0, etag='"v1"', headers={"cache-control": self.CC}),
+            req("r1", 1),
+            req("r2", 15, headers={"Cache-Control": "no-cache"}),
+        ]
+        eng, res = run_events({}, ev)
+        self.assertEqual(res[1]["verdict"], REVALIDATED)
+        self.assertEqual(eng.state["jobs"], [])
+
+    def test_swr_job_200_replaces_entry_after_validator_change(self):
+        ev = [
+            origin("o1", 0, body="v1-body", etag='"v1"',
+                   headers={"cache-control": self.CC}),
+            req("r1", 1),
+            {"id": "ch", "type": "origin_change", "at": 5,
+             "url": "/a", "body": "v2-body", "etag": '"v2"'},
+            req("r2", 15),   # SWR 返回 v1 陈旧副本，作业结算时拿到 200
+            req("r3", 16),   # 作业已结算 -> 新内容 HIT
+        ]
+        eng, res = run_events({}, ev)
+        self.assertEqual(res[1]["verdict"], STALE_WHILE_REVALIDATE)
+        self.assertEqual(res[1]["response_body"], "v1-body")
+        self.assertEqual(res[2]["verdict"], HIT)
+        self.assertEqual(res[2]["response_body"], "v2-body")
+        jobs = [r for r in eng.state["results"] if r.get("type") == "job"]
+        self.assertEqual(jobs[0]["outcome"], "refreshed")
+        # 缓存条目验证器已更新为 v2
+        variant = eng.state["cache"]["GET /a"]["variants"][0]
+        self.assertEqual(variant["headers"]["etag"], '"v2"')
+
+    def test_swr_job_failure_keeps_stale_entry(self):
+        ev = [
+            origin("o1", 0, etag='"v1"', headers={"cache-control": self.CC}),
+            req("r1", 1),
+            {"id": "down", "type": "origin_change", "at": 5,
+             "url": "/a", "fail": True},
+            req("r2", 15),   # SWR，作业结算时源站连接失败 -> 保留陈旧条目
+            req("r3", 16),   # 仍陈旧 -> 再次 SWR（调度新作业）
+            {"id": "up", "type": "origin_change", "at": 20,
+             "url": "/a", "fail": False},
+            req("r4", 25),   # 源站已恢复但条目仍陈旧 -> 第三次 SWR
+            req("r5", 26),   # 第三个作业结算(304) -> HIT
+        ]
+        eng, res = run_events({}, ev)
+        self.assertEqual([r["verdict"] for r in res],
+                         [MISS, STALE_WHILE_REVALIDATE, STALE_WHILE_REVALIDATE,
+                          STALE_WHILE_REVALIDATE, HIT])
+        c = eng.state["counters"]
+        self.assertEqual(c["background_revalidations"], 3)
+        # 前两个作业在源站恢复前到期，均失败
+        self.assertEqual(c["jobs_failed"], 2)
+        self.assertEqual(c["origin_errors"], 2)
+        outcomes = [j["outcome"] for j in eng.state["job_log"]]
+        self.assertEqual(outcomes, ["failed", "failed", "revalidated"])
+
+
+class StaleIfErrorTests(unittest.TestCase):
+    CC = "max-age=10, stale-if-error=30"
+
+    def _5xx_scenario(self, cc, at=15):
+        return [
+            origin("o1", 0, body="cached-body", etag='"v1"',
+                   headers={"cache-control": cc}),
+            req("r1", 1),
+            {"id": "boom", "type": "origin_change", "at": 5,
+             "url": "/a", "status": 503},
+            req("r2", at),
+        ]
+
+    def test_sie_5xx_falls_back_to_stale(self):
+        eng, res = run_events({}, self._5xx_scenario(self.CC))
+        self.assertEqual(res[1]["verdict"], STALE_IF_ERROR)
+        self.assertEqual(res[1]["status"], 200)
+        self.assertEqual(res[1]["response_body"], "cached-body")
+        self.assertIn("warning", res[1]["response_headers"])
+        self.assertEqual(res[1]["stale_info"]["kind"], "stale-if-error")
+        self.assertEqual(res[1]["stale_info"]["origin_status"], 503)
+        codes = [t["code"] for t in res[1]["trace"]]
+        self.assertIn("ORIGIN_5XX", codes)
+        self.assertIn("STALE_IF_ERROR", codes)
+        c = eng.state["counters"]
+        self.assertEqual(c["stale_if_error"], 1)
+        self.assertEqual(c["origin_errors"], 1)
+        self.assertEqual(c["stale_served"], 1)
+
+    def test_sie_window_expired_passes_through_5xx(self):
+        _, res = run_events({}, self._5xx_scenario(self.CC, at=50))
+        self.assertEqual(res[1]["verdict"], ERROR)
+        self.assertEqual(res[1]["status"], 503)
+
+    def test_no_sie_directive_5xx_passthrough_but_entry_kept(self):
+        ev = self._5xx_scenario("max-age=10")
+        ev += [
+            {"id": "heal", "type": "origin_change", "at": 20,
+             "url": "/a", "status": 200},
+            req("r3", 21),   # 条目未被 5xx 失效 -> 304 REVALIDATED
+        ]
+        eng, res = run_events({}, ev)
+        self.assertEqual(res[1]["verdict"], ERROR)
+        self.assertEqual(res[1]["status"], 503)
+        self.assertEqual(res[2]["verdict"], REVALIDATED)
+        self.assertEqual(res[2]["response_body"], "cached-body")
+
+    def test_sie_blocked_by_must_revalidate(self):
+        _, res = run_events({}, self._5xx_scenario(
+            "max-age=10, must-revalidate, stale-if-error=30"))
+        self.assertEqual(res[1]["verdict"], ERROR)
+        self.assertEqual(res[1]["status"], 503)
+
+    def test_5xx_on_miss_no_entry(self):
+        ev = [origin("o1", 0, status=503), req("r1", 1)]
+        eng, res = run_events({}, ev)
+        self.assertEqual(res[0]["verdict"], ERROR)
+        self.assertEqual(res[0]["status"], 503)
+        self.assertEqual(eng.state["cache"], {})
+        self.assertEqual(eng.state["counters"]["origin_errors"], 1)
+
+    def test_connection_failure_bounded_by_sie_window(self):
+        ev = [
+            origin("o1", 0, etag='"v1"', headers={"cache-control": self.CC}),
+            req("r1", 1),
+            {"id": "down", "type": "origin_change", "at": 5,
+             "url": "/a", "fail": True},
+            req("r2", 15),   # 陈旧 4s <= sie 30 -> 连接失败兜底 STALE
+            req("r3", 50),   # 陈旧 39s > 30 -> 504
+        ]
+        eng, res = run_events({}, ev)
+        self.assertEqual(res[1]["verdict"], STALE)
+        self.assertEqual(res[2]["verdict"], ERROR)
+        self.assertEqual(res[2]["status"], 504)
+        codes = [t["code"] for t in res[1]["trace"]]
+        self.assertIn("ORIGIN_CONN_FAIL", codes)
+
+    def test_sie_range_stale_covered_206(self):
+        ev = [
+            origin("o1", 0, url="/f", body="0123456789", etag='"v1"',
+                   headers={"cache-control": "max-age=5, stale-if-error=30"}),
+            rreq("r1", 1, rng="bytes=0-9"),          # 片段拼满 -> 完整条目
+            {"id": "boom", "type": "origin_change", "at": 10,
+             "url": "/f", "status": 503},
+            rreq("r2", 20, rng="bytes=2-7"),         # 陈旧区间重验证遇 5xx -> SIE 206
+        ]
+        _, res = run_events({}, ev)
+        self.assertEqual(res[1]["verdict"], STALE_IF_ERROR)
+        self.assertEqual(res[1]["status"], 206)
+        self.assertEqual(body_of(res[1]), b"234567")
+
+
+class OriginFaultTests(unittest.TestCase):
+    def test_foreground_delay_shifts_entry_lifetime(self):
+        ev = [
+            origin("o1", 0, delay=10, etag='"e"',
+                   headers={"cache-control": "max-age=100"}),
+            req("r1", 1),
+            req("r2", 5),    # 响应 t=11 才到达，age 为负 -> 新鲜 HIT
+        ]
+        eng, res = run_events({}, ev)
+        self.assertEqual(res[0]["verdict"], MISS)
+        self.assertEqual(res[0]["origin_delay"], 10)
+        codes = [t["code"] for t in res[0]["trace"]]
+        self.assertIn("ORIGIN_DELAY", codes)
+        variant = eng.state["cache"]["GET /a"]["variants"][0]
+        self.assertEqual(variant["stored_at"], 11)
+        self.assertEqual(res[1]["verdict"], HIT)
+
+    def test_origin_fail_on_miss_is_504(self):
+        ev = [origin("o1", 0, fail=True,
+                     headers={"cache-control": "max-age=100"}),
+              req("r1", 1)]
+        _, res = run_events({}, ev)
+        self.assertEqual(res[0]["verdict"], ERROR)
+        self.assertEqual(res[0]["status"], 504)
+        codes = [t["code"] for t in res[0]["trace"]]
+        self.assertIn("ORIGIN_CONN_FAIL", codes)
+
+    def test_delay_must_be_non_negative(self):
+        eng = Engine()
+        with self.assertRaises(ValueError):
+            eng.apply_event({"type": "origin", "at": 0, "url": "/a", "delay": -1})
+
+
+class JobPersistenceTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp.close()
+        self.store = Store(self.tmp.name)
+
+    def tearDown(self):
+        self.store.close()
+        os.unlink(self.tmp.name)
+
+    def test_pending_job_persists_across_restart(self):
+        sc = self.store.create_scenario("swr-persist")
+        sid = sc["id"]
+        self.store.add_events(sid, [
+            {"id": "o", "type": "origin", "at": 0, "url": "/a",
+             "etag": '"v1"', "delay": 5,
+             "headers": {"cache-control": "max-age=10, stale-while-revalidate=30"}},
+            req("r1", 1, "/a"),
+            req("r2", 20, "/a"),   # SWR，作业 finish_at=25 待结算
+        ])
+        out = self.store.run(sid)
+        verdicts = [r["verdict"] for r in out["results"] if r["type"] == "request"]
+        self.assertEqual(verdicts, [MISS, STALE_WHILE_REVALIDATE])
+
+        # 重启：新 Store 打开同一库文件，待处理作业必须恢复
+        self.store.close()
+        store2 = Store(self.tmp.name)
+        state = store2.get_state(sid)
+        self.assertEqual(len(state["jobs"]), 1)
+        self.assertEqual(state["jobs"][0]["finish_at"], 25)
+        self.assertEqual(state["jobs"][0]["cache_key"], "GET /a")
+
+        # 虚拟时钟推进过 finish_at：作业结算(304)，请求复用结果 HIT
+        store2.add_event(sid, req("r3", 30, "/a"))
+        out = store2.run(sid)
+        verdicts = [r["verdict"] for r in out["results"] if r["type"] == "request"]
+        self.assertEqual(verdicts, [HIT])
+        self.assertEqual(out["counters"]["jobs_settled"], 1)
+        self.assertEqual(out["counters"]["background_revalidations"], 1)
+        jobs = [r for r in out["results"] if r.get("type") == "job"]
+        self.assertEqual(jobs[0]["outcome"], "revalidated")
+        store2.close()
+        self.store = Store(self.tmp.name)
 
 
 if __name__ == "__main__":

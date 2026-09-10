@@ -11,6 +11,14 @@
   * 共享 / 私有缓存模式（s-maxage、private 仅在共享模式生效）
   * 启发式过期（Last-Modified 年龄比例）
   * 断网失败路径：must-revalidate -> 504；普通陈旧响应允许继续使用
+  * 源站故障仿真：响应延迟（delay，虚拟秒）、连接失败（fail）与 5xx 状态；
+    5xx 不失效已有缓存条目
+  * 陈旧容错：stale-while-revalidate（窗口内直接返回陈旧副本，同时调度后台
+    重验证作业）、stale-if-error（回源 5xx 时按秒数窗口回退陈旧副本；
+    连接失败路径沿用既有断网规则，若声明了 stale-if-error 则受其窗口约束）
+  * 请求合并：同一虚拟时刻、同一缓存键 + Vary 变体只执行一次重验证，
+    其余请求挂接在途作业（返回陈旧副本）或复用结算结果；待处理作业随虚拟
+    时钟推进结算，并随状态持久化到 SQLite，重启后继续
 """
 
 from __future__ import annotations
@@ -51,10 +59,12 @@ REFRESHED = "REFRESHED"            # 重验证/过期回源得到完整新响应
 NOT_MODIFIED = "NOT_MODIFIED"      # 客户端自带条件请求，源站直接 304
 UNCACHEABLE = "UNCACHEABLE"        # 回源成功但响应不允许缓存
 STALE = "STALE"                    # 断网时使用了陈旧副本
-ERROR = "ERROR"                    # 断网且无法满足（504/502）
+ERROR = "ERROR"                    # 断网且无法满足（504/502）或源站 5xx 透传
 RANGE_HIT = "RANGE_HIT"            # 请求区间全部被已缓存片段覆盖，直接 206
 RANGE_FILL = "RANGE_FILL"          # 区间有缺口，回源补齐后返回 206（含首次 206）
 UNSATISFIABLE = "UNSATISFIABLE"    # 范围不可满足，416
+STALE_WHILE_REVALIDATE = "STALE_WHILE_REVALIDATE"  # SWR 窗口内返回陈旧副本，后台重验证
+STALE_IF_ERROR = "STALE_IF_ERROR"  # 回源失败（5xx），按 stale-if-error 回退陈旧副本
 
 # 状态 JSON 中 bytes 的编解码标记（状态可整体落 SQLite，重启后恢复）
 BYTES_KEY = "__bytes_b64__"
@@ -115,9 +125,21 @@ def new_state() -> dict:
             "range_bytes_from_origin": 0,   # 回源拿到的 206 响应体字节
             "segments_merged": 0,           # 片段合并次数
             "segments_invalidated": 0,      # 验证器变化丢弃片段的次数
+            # 陈旧容错与请求合并
+            "background_revalidations": 0,  # 调度过的后台重验证作业数
+            "jobs_settled": 0,              # 已结算的后台作业数
+            "jobs_failed": 0,               # 结算时失败（断网/源站故障/5xx）的作业数
+            "coalesced_requests": 0,        # 挂接到在途作业的请求数
+            "stale_while_revalidate": 0,    # SWR 窗口内直接返回陈旧副本的次数
+            "stale_if_error": 0,            # 源站 5xx 后按 stale-if-error 回退的次数
+            "origin_fetches_saved": 0,      # 因请求合并节省的回源次数
+            "origin_errors": 0,             # 源站连接失败 / 5xx 次数
         },
         "results": [],
         "executed_event_ids": [],
+        "jobs": [],             # 待结算的后台重验证作业（随虚拟时钟推进）
+        "job_seq": 0,           # 作业 id 序号
+        "job_log": [],          # 最近结算的作业结果（最多保留 50 条）
     }
 
 
@@ -341,6 +363,9 @@ class Engine:
         state.setdefault("cache", {})
         state.setdefault("results", [])
         state.setdefault("executed_event_ids", [])
+        state.setdefault("jobs", [])
+        state.setdefault("job_seq", 0)
+        state.setdefault("job_log", [])
         self.state = state
 
     # ---- 事件入口 --------------------------------------------------------
@@ -354,6 +379,8 @@ class Engine:
                 f"事件时间 {at} 早于当前虚拟时钟 {self.state['time']}，虚拟时间只能前进"
             )
         self.state["time"] = at
+        # 虚拟时钟推进到 at：先结算所有到期的后台重验证作业，再处理本事件
+        self._settle_due_jobs(at)
 
         dispatch = {
             "origin": self._apply_origin,
@@ -396,11 +423,21 @@ class Engine:
         ar = self._accept_ranges(event, headers)
         if "accept-ranges" not in headers:
             headers["accept-ranges"] = ar
+        delay = event.get("delay", 0)
+        try:
+            delay = float(delay or 0)
+        except (TypeError, ValueError):
+            raise ValueError(f"delay 必须是数字秒数: {delay!r}")
+        if delay < 0:
+            raise ValueError("delay 不能为负")
         return url, {
             "status": int(event.get("status", 200)),
             "headers": headers,
             "body": norm_body(event.get("body", ""), event.get("body_base64")),
             "accept_ranges": ar,
+            # 故障仿真：响应延迟（虚拟秒）/ 连接失败
+            "delay": delay,
+            "fail": bool(event.get("fail", False)),
         }
 
     def _apply_origin(self, event, at):
@@ -432,6 +469,13 @@ class Engine:
                                     else "none") if isinstance(
                 event["accept_ranges"], bool) else str(event["accept_ranges"]).strip().lower()
             cur["headers"]["accept-ranges"] = cur["accept_ranges"]
+        if event.get("delay") is not None:
+            d = float(event["delay"])
+            if d < 0:
+                raise ValueError("delay 不能为负")
+            cur["delay"] = d
+        if event.get("fail") is not None:
+            cur["fail"] = bool(event["fail"])
         return {"type": "origin_change", "at": at, "url": url,
                 "before": before, "after": self._resource_summary(cur)}
 
@@ -444,6 +488,8 @@ class Engine:
             "cache_control": d["headers"].get("cache-control"),
             "accept_ranges": d.get("accept_ranges",
                                    d["headers"].get("accept-ranges")),
+            "delay": d.get("delay", 0),
+            "fail": bool(d.get("fail", False)),
             "body_bytes": body_len(d.get("body", b"")),
         }
 
@@ -662,24 +708,40 @@ class Engine:
                 served = self._entry_response(entry, age, at)
                 return self._done(counters, served, HIT, at, url, method,
                                   req_headers, trace, entry, origin_used=False)
+            elif self._swr_allows(entry, age, decision, req_cc):
+                # stale-while-revalidate 窗口内：直接返回陈旧副本，
+                # 同一缓存键 + Vary 变体只调度/挂接一个后台重验证作业
+                return self._serve_stale_while_revalidate(
+                    counters, entry, age, at, url, method, req_headers, trace,
+                    cache_key)
             # stale-ok / stale-must：在线回源重验证，断网在路径 B 分流
 
         # ---- 路径 B：回源（MISS / 重验证 / 区间补齐 / 客户端条件请求） ----
+        origin = self.state["origins"].get(url)
+        # 连接失败分流：整体断网，或源站定义了 fail=true（按该源站连接失败处理）
+        conn_fail = None
         if not self.state["network_up"]:
+            conn_fail = "网络断开"
+        elif origin is not None and origin.get("fail"):
+            conn_fail = "源站连接失败（fail=true）"
+            log("ORIGIN_CONN_FAIL", conn_fail + "，走连接失败容错路径")
+
+        if conn_fail is not None:
             if want_range and range_plan is not None and range_plan[0] == "validate-covered":
                 _, entry, interval, rinfo_base, _ = range_plan
-                if not self._must_not_serve_stale(entry, req_cc):
-                    age = self._entry_age(entry, at)
+                age = self._entry_age(entry, at)
+                if self._conn_fail_fallback(entry, age, req_cc):
                     served, rinfo = self._serve_cached_range(
                         entry, range_spec, age, at, stale=True, interval=interval)
                     rinfo = {**rinfo_base, **rinfo, "served_from": "cache-stale"}
                     log("NETWORK_DOWN_STALE",
-                        "网络断开，使用陈旧缓存片段返回 206（带 Warning: 110）")
+                        f"{conn_fail}，使用陈旧缓存片段返回 206（带 Warning: 110）")
                     return self._done(counters, served, STALE, at, url, method,
                                       req_headers, trace, entry, origin_used=False,
                                       range_info=rinfo)
                 log("NETWORK_DOWN_FAIL",
-                    "网络断开，区间虽被陈旧片段覆盖但 must-revalidate/no-cache 禁止兜底，返回 504")
+                    f"{conn_fail}，区间虽被陈旧片段覆盖但 must-revalidate/no-cache 禁止兜底"
+                    "或已超出 stale-if-error 窗口，返回 504")
                 served = self._gateway_error(504, "Gateway Timeout (stale range must revalidate)")
                 return self._done(counters, served, ERROR, at, url, method,
                                   req_headers, trace, entry, origin_used=False)
@@ -688,32 +750,33 @@ class Engine:
                 plan_entry = range_plan[1]
                 if range_plan[7]:
                     # 完整 GET 上的陈旧片段：允许 STALE 兜底（返回不完整内容，trace 标注）
-                    if not self._must_not_serve_stale(plan_entry, req_cc):
-                        age = self._entry_age(plan_entry, at)
+                    age = self._entry_age(plan_entry, at)
+                    if self._conn_fail_fallback(plan_entry, age, req_cc):
                         served = self._entry_response(plan_entry, age, at, stale=True)
                         log("NETWORK_DOWN_STALE",
-                            "网络断开，完整 GET 仅有部分片段，按陈旧副本兜底（内容不完整，已带 Warning: 110）")
+                            f"{conn_fail}，完整 GET 仅有部分片段，按陈旧副本兜底"
+                            "（内容不完整，已带 Warning: 110）")
                         return self._done(counters, served, STALE, at, url, method,
                                           req_headers, trace, plan_entry, origin_used=False,
                                           range_info={"full_get": True, "incomplete": True,
                                                       "gaps": range_plan[3]})
                 log("NETWORK_DOWN_FAIL",
-                    "网络断开且请求区间未被缓存片段完整覆盖（存在缺口），返回 504")
+                    f"{conn_fail}且请求区间未被缓存片段完整覆盖（存在缺口），返回 504")
                 served = self._gateway_error(504, "Gateway Timeout (range gaps, network down)")
                 return self._done(counters, served, ERROR, at, url, method,
                                   req_headers, trace, plan_entry, origin_used=False)
-            if entry is not None and not self._must_not_serve_stale(entry, req_cc):
+            if entry is not None:
                 age = self._entry_age(entry, at)
-                served = self._entry_response(entry, age, at, stale=True)
-                log("NETWORK_DOWN_STALE", "网络断开，使用陈旧缓存副本（带 Warning: 110）")
-                return self._done(counters, served, STALE, at, url, method,
-                                  req_headers, trace, entry, origin_used=False)
-            log("NETWORK_DOWN_FAIL", "网络断开且无可用/不允许使用的缓存副本，返回 504")
+                if self._conn_fail_fallback(entry, age, req_cc):
+                    served = self._entry_response(entry, age, at, stale=True)
+                    log("NETWORK_DOWN_STALE", f"{conn_fail}，使用陈旧缓存副本（带 Warning: 110）")
+                    return self._done(counters, served, STALE, at, url, method,
+                                      req_headers, trace, entry, origin_used=False)
+            log("NETWORK_DOWN_FAIL",
+                f"{conn_fail}且无可用/不允许使用的缓存副本（或超出 stale-if-error 窗口），返回 504")
             served = self._gateway_error(504, "Gateway Timeout (simulated network down)")
             return self._done(counters, served, ERROR, at, url, method,
                               req_headers, trace, entry, origin_used=False)
-
-        origin = self.state["origins"].get(url)
 
         # ---- B-1：分段缓存的缺口补齐 / 陈旧区间重验证 ----
         if want_range and range_plan is not None:
@@ -759,25 +822,57 @@ class Engine:
         origin_resp = {"status": origin_status, "headers": origin_headers, "body": origin_body}
         self._count_origin_response(counters, origin_status, origin_headers, origin_body,
                                     range_hdr=forwarded.get("range"))
+        # 源站响应延迟：响应在 at+delay 才到达，缓存条目的寿命从到达时刻起算
+        delay = self._origin_delay(origin)
+        eff_at = at + delay
+
+        # ---- 5xx：源站错误不失效已有缓存；stale-if-error 窗口内回退陈旧副本 ----
+        if origin_status >= 500:
+            counters["origin_errors"] += 1
+            log("ORIGIN_5XX", f"源站返回 {origin_status}（5xx 不使已有缓存条目失效）")
+            if entry is not None and not client_conditional:
+                age = self._entry_age(entry, at)
+                if self._sie_allows(entry, age, req_cc):
+                    counters["stale_if_error"] += 1
+                    excess = age - (entry["ttl"] or 0.0)
+                    served = self._entry_response(
+                        entry, age, at, stale=True,
+                        warning='110 cache-sim "Response is stale (stale-if-error: origin 5xx)"')
+                    log("STALE_IF_ERROR",
+                        f"陈旧 {excess:.0f}s 在 stale-if-error={entry['sie']:.0f}s 窗口内，"
+                        f"回退陈旧副本（源站 {origin_status}，带 Warning: 110）")
+                    return self._done(
+                        counters, served, STALE_IF_ERROR, at, url, method,
+                        req_headers, trace, entry, origin_used=True,
+                        origin_status=origin_status, origin_resp=origin_resp,
+                        stale_info={"kind": "stale-if-error",
+                                    "window": entry["sie"], "excess": excess,
+                                    "origin_status": origin_status})
+                log("NO_STALE_FALLBACK",
+                    "无 stale-if-error 窗口（或 must-revalidate/no-cache 禁止），透传源站错误")
+            return self._done(counters, origin_resp, ERROR, at, url, method,
+                              req_headers, trace, entry, origin_used=True,
+                              origin_status=origin_status, origin_resp=origin_resp)
 
         # ---- 304 ----
         if origin_status == 304:
             counters["not_modified"] += 1
             if client_conditional:
                 if entry is not None:
-                    self._merge_304(entry, origin_headers, at, trace)
+                    self._merge_304(entry, origin_headers, eff_at, trace)
                 log("CLIENT_NOT_MODIFIED", "源站 304：透传给客户端")
                 return self._done(counters, origin_resp, NOT_MODIFIED, at, url, method,
                                   req_headers, trace, entry, origin_used=True,
                                   origin_status=304, origin_resp=origin_resp)
             if entry is not None and not entry.get("partial"):
-                self._merge_304(entry, origin_headers, at, trace)
+                self._merge_304(entry, origin_headers, eff_at, trace)
                 age = self._entry_age(entry, at)
                 served = self._entry_response(entry, age, at)
                 log("NOT_MODIFIED", "源站 304：合并校验元数据，继续使用缓存副本")
                 return self._done(counters, served, REVALIDATED, at, url, method,
                                   req_headers, trace, entry, origin_used=True,
-                                  origin_status=304, origin_resp=origin_resp)
+                                  origin_status=304, origin_resp=origin_resp,
+                                  origin_delay=delay)
             if entry is not None and entry.get("partial") and "range" not in forwarded:
                 # 缓存里只有部分片段，非区间 GET 不能凭 304 返回空 200：
                 # 去掉条件头完整回源一次
@@ -791,7 +886,7 @@ class Engine:
                 full_resp = {"status": st2, "headers": hd2, "body": bd2}
                 if st2 == 200:
                     return self._full_replaces_for_range(
-                        cache_key, full_resp, entry, url, method, at, req_headers,
+                        cache_key, full_resp, entry, url, method, eff_at, req_headers,
                         req_no_store, trace, counters,
                         reason="部分片段 + 完整 GET：验证器未变，补齐为完整表示")
             log("CLIENT_NOT_MODIFIED", "无（完整）缓存条目却收到 304，原样透传")
@@ -802,7 +897,7 @@ class Engine:
         # ---- 206：分段缓存路径（无缓存条目 / 客户端条件请求 / range_cache 关闭） ----
         if origin_status == 206 and want_range:
             return self._handle_origin_206(
-                cache_key, origin_resp, origin, url, method, at, req_headers,
+                cache_key, origin_resp, origin, url, method, eff_at, req_headers,
                 req_no_store, trace, counters, entry,
                 client_conditional=client_conditional)
 
@@ -833,7 +928,7 @@ class Engine:
                     counters["segments_invalidated"] += 1
                     log("INVALIDATE_SEGMENTS",
                         f"完整 200 的验证器已变化（{basis}），丢弃旧片段")
-            store_info = self._try_store(cache_key, origin_resp, req_headers, at, trace)
+            store_info = self._try_store(cache_key, origin_resp, req_headers, eff_at, trace)
             if store_info["stored"]:
                 stored_entry = store_info["entry"]
             else:
@@ -870,7 +965,8 @@ class Engine:
         return self._done(counters, served, verdict, at, url, method,
                           req_headers, trace, after_entry,
                           origin_used=True, origin_status=origin_status,
-                          origin_resp=origin_resp, range_info=range_info)
+                          origin_resp=origin_resp, range_info=range_info,
+                          origin_delay=delay)
 
     # ---- 字节范围：回源补齐 / 重验证 -------------------------------------
 
@@ -883,6 +979,8 @@ class Engine:
             return self._done(counters, served, ERROR, at, url, method,
                               req_headers, trace, plan[1], origin_used=True,
                               origin_status=502, origin_resp=served)
+        delay = self._origin_delay(origin)
+        eff_at = at + delay
 
         if kind_p == "validate-covered":
             _, entry, interval, rinfo_base, age0 = plan
@@ -901,7 +999,7 @@ class Engine:
             self._count_origin_response(counters, st, hd, bd)
             if st == 304:
                 counters["not_modified"] += 1
-                self._merge_304(entry, hd, at, trace)
+                self._merge_304(entry, hd, eff_at, trace)
                 age = self._entry_age(entry, at)
                 served, rinfo = self._serve_cached_range(entry, None, age, at,
                                                          interval=interval)
@@ -915,8 +1013,36 @@ class Engine:
             if st == 200:
                 return self._full_replaces_for_range(
                     cache_key, {"status": 200, "headers": hd, "body": bd},
-                    entry, url, method, at, req_headers, req_no_store, trace,
+                    entry, url, method, eff_at, req_headers, req_no_store, trace,
                     counters, reason="陈旧重验证返回完整 200（验证器变化）")
+            if st >= 500:
+                counters["origin_errors"] += 1
+                age = self._entry_age(entry, at)
+                if self._sie_allows(entry, age, req_cc):
+                    counters["stale_if_error"] += 1
+                    served, rinfo = self._serve_cached_range(
+                        entry, None, age, at, stale=True, interval=interval,
+                        warning='110 cache-sim "Response is stale (stale-if-error: origin 5xx)"')
+                    rinfo = {**rinfo_base, **rinfo, "served_from": "cache-stale-if-error"}
+                    self._trace(trace, "STALE_IF_ERROR",
+                        f"源站 {st}，陈旧 {age - (entry['ttl'] or 0.0):.0f}s 在 "
+                        f"stale-if-error={entry['sie']:.0f}s 窗口内，用缓存片段拼出 206")
+                    return self._done(
+                        counters, served, STALE_IF_ERROR, at, url, method,
+                        req_headers, trace, entry, origin_used=True, origin_status=st,
+                        origin_resp={"status": st, "headers": hd, "body": bd},
+                        range_info=rinfo,
+                        stale_info={"kind": "stale-if-error", "window": entry["sie"],
+                                    "excess": age - (entry["ttl"] or 0.0),
+                                    "origin_status": st})
+                self._trace(trace, "ORIGIN_5XX",
+                            f"源站 {st} 且无 stale-if-error 回退，返回 504")
+                served = self._gateway_error(
+                    504, f"Gateway Timeout (origin {st}, no stale-if-error fallback)")
+                return self._done(counters, served, ERROR, at, url, method,
+                                  req_headers, trace, entry, origin_used=True,
+                                  origin_status=st,
+                                  origin_resp={"status": st, "headers": hd, "body": bd})
             served = self._gateway_error(502, f"Unexpected origin status {st} for range revalidation")
             return self._done(counters, served, ERROR, at, url, method,
                               req_headers, trace, entry, origin_used=True)
@@ -973,7 +1099,7 @@ class Engine:
                 # If-Range 不匹配：源站忽略 Range，返回完整表示。丢弃旧片段
                 return self._full_replaces_for_range(
                     cache_key, {"status": 200, "headers": hd, "body": bd},
-                    entry, url, method, at, req_headers, req_no_store, trace,
+                    entry, url, method, eff_at, req_headers, req_no_store, trace,
                     counters, reason="回源补缺口时验证器已变化（If-Range 不匹配）")
             if st == 416:
                 counters["unsatisfiable"] += 1
@@ -983,6 +1109,16 @@ class Engine:
                                   req_headers, trace, entry, origin_used=True,
                                   origin_status=416, origin_resp=served,
                                   range_info={**rinfo_base, "served_from": "origin-416"})
+            if st >= 500:
+                counters["origin_errors"] += 1
+                self._trace(trace, "ORIGIN_5XX",
+                    f"补齐缺口时源站返回 {st}（5xx 不失效旧片段），无法补齐，返回 504")
+                served = self._gateway_error(
+                    504, f"Gateway Timeout (origin {st} during range fill)")
+                return self._done(counters, served, ERROR, at, url, method,
+                                  req_headers, trace, entry, origin_used=True,
+                                  origin_status=st,
+                                  origin_resp={"status": st, "headers": hd, "body": bd})
             if st != 206:
                 served = self._gateway_error(502, f"Unexpected origin status {st} during range fill")
                 return self._done(counters, served, ERROR, at, url, method,
@@ -1000,7 +1136,7 @@ class Engine:
                 cache_key,
                 {"status": 206, "headers": fh,
                  "body": fb if len(fb) == fe - fs + 1 else fb[:fe - fs + 1]},
-                (fs, fe, flen), req_headers, at, trace, expected_entry=entry)
+                (fs, fe, flen), req_headers, eff_at, trace, expected_entry=entry)
             if not store_info["stored"]:
                 # 合并被拒绝（验证器不一致）：安全回退完整回源
                 self._trace(trace, "RANGE_MERGE_REJECTED",
@@ -1012,7 +1148,7 @@ class Engine:
                 self._count_origin_response(counters, st, hd, bd)
                 return self._full_replaces_for_range(
                     cache_key, {"status": st, "headers": hd, "body": bd},
-                    entry, url, method, at, req_headers, req_no_store, trace,
+                    entry, url, method, eff_at, req_headers, req_no_store, trace,
                     counters, reason=store_info["reason"])
             entry = store_info["entry"]
 
@@ -1285,6 +1421,8 @@ class Engine:
                 "no_cache": "no-cache" in cc,
                 "must_revalidate": self._must_revalidate(cc),
                 "rev_by": "proxy" if "proxy-revalidate" in cc else "must",
+                "swr": self._cc_seconds(cc, "stale-while-revalidate"),
+                "sie": self._cc_seconds(cc, "stale-if-error"),
                 "partial": True,
                 "length": flen,
                 "segments": [{"start": fs, "end": fe, "body": body}],
@@ -1317,6 +1455,12 @@ class Engine:
             existing["no_cache"] = True
         if self._must_revalidate(new_cc):
             existing["must_revalidate"] = True
+        new_swr = self._cc_seconds(new_cc, "stale-while-revalidate")
+        if new_swr is not None:
+            existing["swr"] = new_swr
+        new_sie = self._cc_seconds(new_cc, "stale-if-error")
+        if new_sie is not None:
+            existing["sie"] = new_sie
         ttl_txt = "None" if existing["ttl"] is None else f"{existing['ttl']:.0f}s"
         trace.append({"step": len(trace) + 1, "code": "RANGE_MERGE_FRESHNESS",
                       "detail": "片段合并沿用原新鲜度窗口（206 不延长寿命），"
@@ -1356,7 +1500,7 @@ class Engine:
     # ---- 206 / 416 响应组装 ----------------------------------------------
 
     def _serve_cached_range(self, entry, range_spec, age, at, stale=False,
-                            interval=None):
+                            interval=None, warning=None):
         """用缓存条目（完整或片段）拼出 206；缺片段返回 (None, info)。"""
         if interval is None:
             interval = resolve_range(range_spec, entry["length"])
@@ -1374,7 +1518,8 @@ class Engine:
         headers["content-length"] = str(last - first + 1)
         headers["age"] = str(int(max(0, age)))
         if stale:
-            headers["warning"] = '110 cache-sim "Response is stale (network disconnected)"'
+            headers["warning"] = warning or \
+                '110 cache-sim "Response is stale (network disconnected)"'
         served = {"status": 206, "headers": headers, "body": data}
         info = {"first": first, "last": last, "length": entry["length"],
                 "covered": covered, "gaps": [], "served_bytes": last - first + 1,
@@ -1483,9 +1628,220 @@ class Engine:
             return True
         return False
 
+    # ---- 陈旧容错（stale-while-revalidate / stale-if-error） --------------
+
+    @staticmethod
+    def _cc_seconds(cc, key):
+        """从解析后的 Cache-Control 取秒数指令；未声明返回 None（区别于显式 0）。"""
+        v = cc.get(key)
+        return float(v) if isinstance(v, int) else None
+
+    def _swr_allows(self, entry, age, decision, req_cc) -> bool:
+        """是否可在 stale-while-revalidate 窗口内直接返回陈旧副本 + 后台重验证。"""
+        if decision != "stale-ok":
+            # fresh 不需要；stale-must（must-revalidate / 请求 no-cache）禁止
+            return False
+        swr = entry.get("swr")
+        if swr is None:
+            return False
+        # 请求显式新鲜度约束（max-age/min-fresh）优先，不用 SWR 糊弄客户端
+        if isinstance(req_cc.get("max-age"), int) or isinstance(req_cc.get("min-fresh"), int):
+            return False
+        excess = age - (entry["ttl"] or 0.0)
+        return excess <= swr
+
+    def _sie_allows(self, entry, age, req_cc) -> bool:
+        """源站出错（5xx）时是否允许按 stale-if-error 窗口回退陈旧副本。"""
+        if self._must_not_serve_stale(entry, req_cc):
+            return False
+        sie = entry.get("sie")
+        if sie is None:
+            return False
+        return age - (entry["ttl"] or 0.0) <= sie
+
+    def _conn_fail_fallback(self, entry, age, req_cc) -> bool:
+        """连接失败（断网 / 源站 fail）时能否回退陈旧副本。
+
+        未声明 stale-if-error 时沿用既有行为（允许，除非 must-revalidate 等）；
+        声明了则受秒数窗口约束。
+        """
+        if self._must_not_serve_stale(entry, req_cc):
+            return False
+        sie = entry.get("sie")
+        if sie is None:
+            return True
+        return age - (entry["ttl"] or 0.0) <= sie
+
+    def _serve_stale_while_revalidate(self, counters, entry, age, at, url, method,
+                                      req_headers, trace, cache_key):
+        """SWR 窗口内直接返回陈旧副本；调度或挂接后台重验证作业。"""
+        swr = entry["swr"]
+        excess = age - (entry["ttl"] or 0.0)
+        job = self._find_pending_job(cache_key, entry["variant_key"])
+        coalesced = job is not None
+        if coalesced:
+            job["attached"] += 1
+            counters["coalesced_requests"] += 1
+            counters["origin_fetches_saved"] += 1
+            self._trace(trace, "SWR_COALESCED",
+                        f"在途重验证作业 {job['id']} 已存在（将于 t={job['finish_at']:.0f} 结算），"
+                        f"本请求挂接为第 {job['attached']} 个跟随者，合并节省一次回源")
+        else:
+            job = self._schedule_job(cache_key, entry, url, method, req_headers,
+                                     at, trace)
+        counters["stale_while_revalidate"] += 1
+        served = self._entry_response(
+            entry, age, at, stale=True,
+            warning='110 cache-sim "Response is stale (stale-while-revalidate)"')
+        self._trace(trace, "STALE_WHILE_REVALIDATE",
+                    f"陈旧 {excess:.0f}s 在 stale-while-revalidate={swr:.0f}s 窗口内，"
+                    "直接返回陈旧副本（Warning: 110）；后台重验证"
+                    + ("复用在途作业" if coalesced else "已调度"))
+        stale_info = {"kind": "stale-while-revalidate", "window": swr,
+                      "excess": excess, "job_id": job["id"],
+                      "coalesced": coalesced, "job_finish_at": job["finish_at"]}
+        return self._done(counters, served, STALE_WHILE_REVALIDATE, at, url,
+                          method, req_headers, trace, entry, origin_used=False,
+                          stale_info=stale_info)
+
+    # ---- 后台重验证作业（请求合并 + 虚拟时钟推进 + 持久化） -----------------
+
+    def _find_pending_job(self, cache_key, variant_key):
+        for j in self.state.get("jobs", []):
+            if j["cache_key"] == cache_key and j["variant_key"] == variant_key:
+                return j
+        return None
+
+    def _schedule_job(self, cache_key, entry, url, method, req_headers, at, trace):
+        origin = self.state["origins"].get(url)
+        delay = self._origin_delay(origin) if origin else 0.0
+        self.state["job_seq"] = self.state.get("job_seq", 0) + 1
+        job = {
+            "id": f"job-{self.state['job_seq']}",
+            "kind": "revalidate",
+            "cache_key": cache_key,
+            "variant_key": entry["variant_key"],
+            "url": url,
+            "method": method,
+            "req_headers": dict(req_headers),
+            "started_at": at,
+            "finish_at": at + delay,   # 源站延迟决定作业何时结算
+            "attached": 0,
+        }
+        self.state["jobs"].append(job)
+        self.state["counters"]["background_revalidations"] += 1
+        self._trace(trace, "SWR_SCHEDULE",
+                    f"调度后台重验证作业 {job['id']}（键 {cache_key}，变体 "
+                    f"{entry['variant_key']}）：源站延迟 {delay:.0f}s，"
+                    f"将于 t={job['finish_at']:.0f} 由虚拟时钟结算")
+        return job
+
+    def _settle_due_jobs(self, up_to):
+        """虚拟时钟推进到 up_to：结算所有 finish_at <= up_to 的作业。"""
+        jobs = self.state.get("jobs", [])
+        if not jobs:
+            return
+        due = [j for j in jobs if j["finish_at"] <= up_to]
+        if not due:
+            return
+        self.state["jobs"] = [j for j in jobs if j["finish_at"] > up_to]
+        for job in sorted(due, key=lambda j: (j["finish_at"], j["id"])):
+            self._settle_job(job)
+
+    def _settle_job(self, job):
+        """结算一个后台重验证作业：按当前条目验证器发条件请求并应用结果。
+
+        验证器变化 / 条目被清除时绝不复用不合规旧内容：
+        304 合并进当前条目，200 经 _try_store 全量替换，5xx/故障保留陈旧条目。
+        """
+        counters = self.state["counters"]
+        counters["jobs_settled"] += 1
+        at = job["finish_at"]
+        trace = []
+        self._trace(trace, "JOB_SETTLE",
+                    f"后台重验证作业 {job['id']} 于 t={at:.0f} 结算"
+                    f"（调度于 t={job['started_at']:.0f}，挂接请求 {job['attached']} 个）")
+        entry = None
+        bucket = self.state["cache"].get(job["cache_key"])
+        if bucket:
+            entry = next((v for v in bucket["variants"]
+                          if v["variant_key"] == job["variant_key"]), None)
+
+        if entry is None:
+            outcome, detail = "discarded", "缓存条目已不存在（被清除或替换），作业结果丢弃"
+            self._trace(trace, "JOB_DISCARDED", detail)
+        elif not self.state["network_up"]:
+            outcome, detail = "failed", "结算时网络断开，保留陈旧条目"
+            counters["jobs_failed"] += 1
+            counters["origin_errors"] += 1
+            self._trace(trace, "JOB_FAILED", detail)
+        else:
+            origin = self.state["origins"].get(job["url"])
+            if origin is None:
+                outcome, detail = "failed", "源站未定义资源，保留陈旧条目"
+                counters["jobs_failed"] += 1
+                self._trace(trace, "JOB_FAILED", detail)
+            elif origin.get("fail"):
+                outcome, detail = "failed", "源站连接失败（fail=true），保留陈旧条目"
+                counters["jobs_failed"] += 1
+                counters["origin_errors"] += 1
+                self._trace(trace, "JOB_FAILED", detail)
+            else:
+                fwd = {}
+                if entry["headers"].get("etag"):
+                    fwd["if-none-match"] = entry["headers"]["etag"]
+                elif entry["headers"].get("last-modified"):
+                    fwd["if-modified-since"] = entry["headers"]["last-modified"]
+                counters["origin_fetches"] += 1
+                counters["revalidations"] += 1
+                st, hd, bd = self._fetch_origin(origin, fwd, at, trace)
+                self._count_origin_response(counters, st, hd, bd)
+                if st == 304:
+                    counters["not_modified"] += 1
+                    self._merge_304(entry, hd, at, trace)
+                    outcome, detail = "revalidated", "源站 304：合并校验元数据，age 归零"
+                elif st >= 500:
+                    counters["jobs_failed"] += 1
+                    counters["origin_errors"] += 1
+                    outcome, detail = "failed", f"源站返回 {st}，保留陈旧条目（5xx 不失效缓存）"
+                    self._trace(trace, "JOB_FAILED", detail)
+                else:
+                    info = self._try_store(job["cache_key"],
+                                           {"status": st, "headers": hd, "body": bd},
+                                           job.get("req_headers", {}), at, trace)
+                    if info["stored"]:
+                        outcome, detail = "refreshed", f"源站 {st}：缓存条目已更新"
+                    else:
+                        self._invalidate_variant(job["cache_key"], entry)
+                        outcome, detail = ("invalidated",
+                                           f"新响应不可缓存（{info['reason']}），旧条目已失效")
+        doc = {"type": "job", "event_id": None, "job_id": job["id"], "at": at,
+               "url": job["url"], "cache_key": job["cache_key"],
+               "outcome": outcome, "detail": detail,
+               "attached": job["attached"], "trace": trace}
+        self.state["results"].append(doc)
+        log = self.state.setdefault("job_log", [])
+        log.append({k: doc[k] for k in
+                    ("job_id", "at", "url", "outcome", "detail", "attached")})
+        del log[:-50]
+
     # ---- 源站模拟 --------------------------------------------------------
 
+    @staticmethod
+    def _origin_delay(origin) -> float:
+        """源站响应延迟（虚拟秒）；非法值按 0 处理。"""
+        if not origin:
+            return 0.0
+        try:
+            return max(0.0, float(origin.get("delay", 0) or 0))
+        except (TypeError, ValueError):
+            return 0.0
+
     def _fetch_origin(self, origin, fwd_headers, at, trace):
+        delay = self._origin_delay(origin)
+        if delay > 0:
+            self._trace(trace, "ORIGIN_DELAY",
+                        f"源站响应延迟 {delay:.0f}s（虚拟时间），响应于 t={at + delay:.0f} 到达")
         headers = copy.deepcopy(origin["headers"])
         status = origin["status"]
         body = origin["body"]
@@ -1596,6 +1952,8 @@ class Engine:
         entry["no_cache"] = "no-cache" in cc
         entry["must_revalidate"] = self._must_revalidate(cc)
         entry["rev_by"] = "proxy" if "proxy-revalidate" in cc else "must"
+        entry["swr"] = self._cc_seconds(cc, "stale-while-revalidate")
+        entry["sie"] = self._cc_seconds(cc, "stale-if-error")
         self._trace(trace, "MERGE_304", "304 响应头已合并进缓存条目，age 归零（片段保留）")
 
     def _must_revalidate(self, cc) -> bool:
@@ -1685,6 +2043,8 @@ class Engine:
             "no_cache": "no-cache" in cc,
             "must_revalidate": self._must_revalidate(cc),
             "rev_by": "proxy" if "proxy-revalidate" in cc else "must",
+            "swr": self._cc_seconds(cc, "stale-while-revalidate"),
+            "sie": self._cc_seconds(cc, "stale-if-error"),
             "partial": False,
             "length": body_len(body),
             "segments": [],
@@ -1719,11 +2079,12 @@ class Engine:
 
     # ---- 组装响应 / 结果文档 ----------------------------------------------
 
-    def _entry_response(self, entry, age, at, stale=False):
+    def _entry_response(self, entry, age, at, stale=False, warning=None):
         headers = copy.deepcopy(entry["headers"])
         headers["age"] = str(int(max(0, age)))
         if stale:
-            headers["warning"] = '110 cache-sim "Response is stale (network disconnected)"'
+            headers["warning"] = warning or \
+                '110 cache-sim "Response is stale (network disconnected)"'
         return {"status": entry["status"], "headers": headers, "body": entry["body"]}
 
     @staticmethod
@@ -1734,13 +2095,15 @@ class Engine:
 
     def _done(self, counters, served, verdict, at, url, method, req_headers,
               trace, entry, origin_used, origin_status=None, origin_resp=None,
-              range_info=None, origin_bytes=None):
+              range_info=None, origin_bytes=None, stale_info=None,
+              origin_delay=None):
         served_body = served.get("body", b"")
         counters["bytes_served"] += wire_size(
             served["status"], served["headers"], served_body)
-        if verdict in (HIT, RANGE_HIT, REVALIDATED, STALE):
+        if verdict in (HIT, RANGE_HIT, REVALIDATED, STALE,
+                       STALE_WHILE_REVALIDATE, STALE_IF_ERROR):
             counters["hits"] += 1
-        if verdict == STALE:
+        if verdict in (STALE, STALE_WHILE_REVALIDATE, STALE_IF_ERROR):
             counters["stale_served"] += 1
         if verdict == ERROR:
             counters["errors"] += 1
@@ -1776,6 +2139,10 @@ class Engine:
         }
         if range_info is not None:
             out["range"] = range_info
+        if stale_info is not None:
+            out["stale_info"] = stale_info
+        if origin_delay:
+            out["origin_delay"] = origin_delay
         return out
 
     @staticmethod
@@ -1788,6 +2155,8 @@ class Engine:
             "ttl": entry["ttl"],
             "no_cache": entry["no_cache"],
             "must_revalidate": entry["must_revalidate"],
+            "swr": entry.get("swr"),
+            "sie": entry.get("sie"),
             "stored_at": entry["stored_at"],
             "etag": entry["headers"].get("etag"),
             "last_modified": entry["headers"].get("last-modified"),

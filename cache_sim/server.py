@@ -12,6 +12,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 from .store import Store
+from .engine import _json_default
 
 SID = r"[0-9a-zA-Z_-]{6,64}"
 
@@ -45,7 +46,10 @@ class Handler(BaseHTTPRequestHandler):
     # ---- 基础收发 --------------------------------------------------------
 
     def _send(self, code: int, payload):
-        body = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+        # default=_json_default：事件载荷/结果里可能含 bytes（如 origin body），
+        # 统一按 {"__bytes_b64__": ...} 标记输出，与状态持久化格式一致
+        body = json.dumps(payload, ensure_ascii=False, indent=2,
+                          default=_json_default).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
@@ -244,17 +248,27 @@ class Handler(BaseHTTPRequestHandler):
         rows = []
         for it in items[1:]:
             c0, c1 = base["counters"], it["counters"]
+
+            def delta(key):
+                return c1.get(key, 0) - c0.get(key, 0)
+
             rows.append({
                 "a": base["scenario_id"], "b": it["scenario_id"],
-                "delta_origin_fetches": c1["origin_fetches"] - c0["origin_fetches"],
-                "delta_bytes_from_origin": c1["bytes_from_origin"] - c0["bytes_from_origin"],
-                "delta_hits": c1["hits"] - c0["hits"],
-                "delta_errors": c1["errors"] - c0["errors"],
-                "delta_range_fills": c1.get("range_fills", 0) - c0.get("range_fills", 0),
-                "delta_range_hits": c1.get("range_hits", 0) - c0.get("range_hits", 0),
-                "delta_range_bytes_from_origin": (
-                    c1.get("range_bytes_from_origin", 0)
-                    - c0.get("range_bytes_from_origin", 0)),
+                "delta_origin_fetches": delta("origin_fetches"),
+                "delta_bytes_from_origin": delta("bytes_from_origin"),
+                "delta_hits": delta("hits"),
+                "delta_errors": delta("errors"),
+                "delta_range_fills": delta("range_fills"),
+                "delta_range_hits": delta("range_hits"),
+                "delta_range_bytes_from_origin": delta("range_bytes_from_origin"),
+                # 陈旧容错与请求合并
+                "delta_stale_served": delta("stale_served"),
+                "delta_stale_while_revalidate": delta("stale_while_revalidate"),
+                "delta_stale_if_error": delta("stale_if_error"),
+                "delta_background_revalidations": delta("background_revalidations"),
+                "delta_coalesced_requests": delta("coalesced_requests"),
+                "delta_origin_fetches_saved": delta("origin_fetches_saved"),
+                "delta_origin_errors": delta("origin_errors"),
                 "same_verdict_sequence": base["verdicts"] == it["verdicts"],
             })
         self._send(200, {"items": items, "comparisons": rows})
@@ -294,6 +308,8 @@ class Handler(BaseHTTPRequestHandler):
                         "fresh": fresh,
                         "no_cache": v["no_cache"],
                         "must_revalidate": v["must_revalidate"],
+                        "swr": v.get("swr"),
+                        "sie": v.get("sie"),
                         "etag": v["headers"].get("etag"),
                         "last_modified": v["headers"].get("last-modified"),
                         "accept_ranges": v["headers"].get("accept-ranges"),
@@ -318,6 +334,15 @@ class Handler(BaseHTTPRequestHandler):
             "counters": state["counters"],
             "executed_event_ids": state["executed_event_ids"],
             "pending_events": self._pending_events(sid, state),
+            # 待结算的后台重验证作业（随虚拟时钟推进）与最近结算记录
+            "pending_jobs": [
+                {"job_id": j["id"], "kind": j["kind"], "url": j["url"],
+                 "cache_key": j["cache_key"], "variant_key": j["variant_key"],
+                 "started_at": j["started_at"], "finish_at": j["finish_at"],
+                 "attached": j["attached"],
+                 "remaining": round(max(0.0, j["finish_at"] - now), 3)}
+                for j in state.get("jobs", [])],
+            "job_log": state.get("job_log", [])[-20:],
         }
         if include_results:
             results = state.get("results", [])
@@ -341,6 +366,8 @@ class Handler(BaseHTTPRequestHandler):
             "cache_control": d["headers"].get("cache-control"),
             "accept_ranges": d.get("accept_ranges",
                                    d["headers"].get("accept-ranges")),
+            "delay": d.get("delay", 0),
+            "fail": bool(d.get("fail", False)),
             "body_bytes": n,
         }
 

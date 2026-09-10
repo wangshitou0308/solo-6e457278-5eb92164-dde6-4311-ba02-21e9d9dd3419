@@ -109,8 +109,7 @@ def demo_offline():
 
         # ---- 复制场景做 A/B 对比：同一序列，不同缓存规则 ----
         clone_b = store.clone_scenario(sid, "demo-no-etag-rule",
-                                       {"default_cc": {"max-age": 30}})
-        # B 场景里给 /article 之外的资源也注入缺省指令的对比意义有限，
+                                       {"default_cc": {"max-age": 30}})        # B 场景里给 /article 之外的资源也注入缺省指令的对比意义有限，
         # 这里另建一个纯无缓存头场景来对比 default_cc
         plain = store.create_scenario("ab-base")
         store.add_events(plain["id"], [
@@ -126,6 +125,44 @@ def demo_offline():
         pprint("A/B 对比：base vs 注入 default max-age=60",
                {"base": store.get_state(plain["id"])["counters"],
                 "tuned": store.get_state(tuned["id"])["counters"]})
+
+        # ---- 陈旧容错（SWR/SIE）+ 请求合并 + 源站故障 ----
+        swr = store.create_scenario("swr-sie-demo")
+        store.add_events(swr["id"], [
+            # /feed：max-age=10，SWR 窗口 30s，SIE 窗口 60s；源站响应延迟 5s
+            {"id": "o", "type": "origin", "at": 0, "url": "/feed",
+             "body": "feed-v1", "etag": '"f1"', "delay": 5,
+             "headers": {"cache-control":
+                         "max-age=10, stale-while-revalidate=30, stale-if-error=60"}},
+            {"id": "q1", "type": "request", "at": 1, "url": "/feed"},
+            # 陈旧 4s（SWR 窗口内）-> 直接返回陈旧副本，调度后台重验证（t=25 结算）
+            {"id": "q2", "type": "request", "at": 20, "url": "/feed"},
+            # 作业在途 -> 挂接合并，返回陈旧副本（节省一次回源）
+            {"id": "q3", "type": "request", "at": 21, "url": "/feed"},
+            # t=25 作业结算（304）-> 复用结果，HIT
+            {"id": "q4", "type": "request", "at": 30, "url": "/feed"},
+            # 源站开始返回 503
+            {"id": "boom", "type": "origin_change", "at": 35,
+             "url": "/feed", "status": 503},
+            # 已超出 SWR 窗口（25+10+30=65）但在 SIE 窗口内 -> 回退陈旧副本
+            {"id": "q5", "type": "request", "at": 70, "url": "/feed"},
+            # 源站恢复
+            {"id": "heal", "type": "origin_change", "at": 80,
+             "url": "/feed", "status": 200},
+            {"id": "q6", "type": "request", "at": 81, "url": "/feed"},
+        ])
+        out = store.run(swr["id"])
+        pprint("SWR/SIE 判定序列（含后台作业结算）",
+               [(r["at"], r.get("url") or r.get("job_id"),
+                 r.get("verdict")
+                 or (f"job:{r['outcome']}" if r["type"] == "job" else r["type"]))
+                for r in out["results"]])
+        pprint("SWR/SIE 计数器（后台重验证/合并/陈旧回退/节省回源）",
+               {k: v for k, v in out["counters"].items()
+                if k in ("background_revalidations", "jobs_settled",
+                         "coalesced_requests", "stale_while_revalidate",
+                         "stale_if_error", "origin_fetches_saved",
+                         "origin_errors", "origin_fetches")})
 
         # 重置演示
         store.reset(sid)

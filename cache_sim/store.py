@@ -264,7 +264,11 @@ class Store:
 
         results = []
         for _, payload in pending:
-            results.append(engine.apply_event(payload))
+            # apply_event 会先结算到期的后台作业（产生 job 结果文档）再执行事件，
+            # 这里按状态中的追加顺序收集全部新结果，保持时间序
+            before = len(engine.state["results"])
+            engine.apply_event(payload)
+            results.extend(engine.state["results"][before:])
 
         self.save_state(sid, engine.state)
         with self._lock:
