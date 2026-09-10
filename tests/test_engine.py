@@ -1049,6 +1049,119 @@ class OriginFaultTests(unittest.TestCase):
             eng.apply_event({"type": "origin", "at": 0, "url": "/a", "delay": -1})
 
 
+class JobWaitAndDelayTests(unittest.TestCase):
+    """复核确认的两处缺陷的回归测试：
+    1) no-cache 请求遇在途 SWR 作业应挂接等待、复用结果，只重验证一次；
+    2) 带 delay 的后台作业时间基准统一（到达=结算=生效）。
+    """
+    CC = "max-age=10, stale-while-revalidate=30"
+
+    def test_no_cache_request_waits_for_inflight_job(self):
+        ev = [
+            origin("o1", 0, etag='"v1"', delay=5,
+                   headers={"cache-control": self.CC}),
+            req("r1", 1),    # MISS，stored_at=6，新鲜到 16
+            req("r2", 20),   # SWR：陈旧副本 + 作业 finish_at=25
+            req("r3", 21, headers={"Cache-Control": "no-cache"}),
+            # 修复前：no-cache 自行回源重验证；修复后：挂接等待作业 -> HIT
+        ]
+        eng, res = run_events({}, ev)
+        self.assertEqual([r["verdict"] for r in res],
+                         [MISS, STALE_WHILE_REVALIDATE, HIT])
+        wait = res[2]["job_wait"]
+        self.assertEqual(wait["job_id"], "job-1")
+        self.assertEqual(wait["wait_seconds"], 4)
+        codes = [t["code"] for t in res[2]["trace"]]
+        self.assertIn("JOB_WAIT", codes)
+        self.assertIn("JOB_RESULT_REUSED", codes)
+        c = eng.state["counters"]
+        self.assertEqual(c["revalidations"], 1)      # 只重验证一次（作业）
+        self.assertEqual(c["origin_fetches"], 2)     # r1 + 作业
+        self.assertEqual(c["coalesced_requests"], 1)
+        self.assertEqual(c["origin_fetches_saved"], 1)
+        self.assertEqual(c["jobs_settled"], 1)
+        # 作业已被消费：不会在后续（含重启后）再重验证一次
+        self.assertEqual(eng.state["jobs"], [])
+
+    def test_no_cache_wait_job_refreshed_200(self):
+        ev = [
+            origin("o1", 0, body="v1-body", etag='"v1"', delay=5,
+                   headers={"cache-control": self.CC}),
+            req("r1", 1),    # MISS，stored_at=6
+            {"id": "ch", "type": "origin_change", "at": 5,
+             "url": "/a", "body": "v2-body", "etag": '"v2"'},
+            req("r2", 20),   # SWR + 作业（finish_at=25，在途）
+            req("r3", 21, headers={"Cache-Control": "no-cache"}),
+        ]
+        _, res = run_events({}, ev)
+        self.assertEqual(res[2]["verdict"], HIT)
+        # 复用的是作业取回的合规新内容，不是旧副本
+        self.assertEqual(res[2]["response_body"], "v2-body")
+
+    def test_no_cache_wait_job_5xx_fails_504(self):
+        ev = [
+            origin("o1", 0, etag='"v1"', delay=5,
+                   headers={"cache-control": self.CC}),
+            req("r1", 1),
+            {"id": "boom", "type": "origin_change", "at": 5,
+             "url": "/a", "status": 503},
+            req("r2", 20),   # SWR + 作业（finish_at=25，在途）
+            req("r3", 21, headers={"Cache-Control": "no-cache"}),
+            # 等待 -> 作业遇 5xx 失败 -> no-cache 禁止陈旧兜底 -> 504
+        ]
+        eng, res = run_events({}, ev)
+        self.assertEqual(res[2]["verdict"], ERROR)
+        self.assertEqual(res[2]["status"], 504)
+        codes = [t["code"] for t in res[2]["trace"]]
+        self.assertIn("JOB_FAILED_NO_FALLBACK", codes)
+        c = eng.state["counters"]
+        self.assertEqual(c["jobs_failed"], 1)
+        self.assertEqual(c["origin_errors"], 1)
+
+    def test_constrained_request_waits_and_sie_fallback_on_5xx(self):
+        # 请求 max-age=0（显式新鲜度约束，不走 SWR）：等待作业，作业遇 5xx，
+        # 无 no-cache -> 按 stale-if-error 窗口回退陈旧副本
+        ev = [
+            origin("o1", 0, etag='"v1"', delay=5,
+                   headers={"cache-control":
+                            "max-age=10, stale-while-revalidate=5, stale-if-error=60"}),
+            req("r1", 1),    # MISS，stored_at=6
+            {"id": "boom", "type": "origin_change", "at": 5,
+             "url": "/a", "status": 503},
+            req("r2", 20),   # 陈旧 4s <= 5 -> SWR + 作业（finish_at=25，在途）
+            req("r3", 21, headers={"Cache-Control": "max-age=0"}),
+        ]
+        _, res = run_events({}, ev)
+        self.assertEqual(res[2]["verdict"], STALE_IF_ERROR)
+        self.assertEqual(res[2]["status"], 200)
+        self.assertEqual(res[2]["job_wait"]["job_id"], "job-1")
+
+    def test_background_job_delay_time_base_unified(self):
+        ev = [
+            origin("o1", 0, etag='"v1"', delay=5,
+                   headers={"cache-control": self.CC}),
+            req("r1", 1),     # MISS，stored_at=6
+            req("r2", 20),    # SWR，作业 finish_at=25
+            req("r3", 24),    # 作业在途 -> 仍是 SWR 陈旧（结果尚未生效）
+            req("r4", 26),    # 作业 t=25 结算(304) -> HIT
+        ]
+        eng, res = run_events({}, ev)
+        self.assertEqual([r["verdict"] for r in res],
+                         [MISS, STALE_WHILE_REVALIDATE,
+                          STALE_WHILE_REVALIDATE, HIT])
+        job = [r for r in eng.state["results"] if r.get("type") == "job"][0]
+        self.assertEqual(job["at"], 25)          # 结算时刻 = 到达时刻
+        delay_traces = [t for t in job["trace"] if t["code"] == "ORIGIN_DELAY"]
+        self.assertEqual(len(delay_traces), 1)
+        detail = delay_traces[0]["detail"]
+        self.assertIn("t=20", detail)            # 发出时刻
+        self.assertIn("t=25", detail)            # 到达 = 结算
+        self.assertNotIn("t=30", detail)         # 延迟不再重复计
+        # 结果生效时刻与条目 stored_at 一致，t=26 的 HIT 符合时钟顺序
+        variant = eng.state["cache"]["GET /a"]["variants"][0]
+        self.assertEqual(variant["stored_at"], 25)
+
+
 class JobPersistenceTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
@@ -1091,6 +1204,49 @@ class JobPersistenceTests(unittest.TestCase):
         jobs = [r for r in out["results"] if r.get("type") == "job"]
         self.assertEqual(jobs[0]["outcome"], "revalidated")
         store2.close()
+        self.store = Store(self.tmp.name)
+
+    def test_no_cache_wait_job_persists_across_restart(self):
+        sc = self.store.create_scenario("swr-wait-persist")
+        sid = sc["id"]
+        self.store.add_events(sid, [
+            {"id": "o", "type": "origin", "at": 0, "url": "/a",
+             "etag": '"v1"', "delay": 5,
+             "headers": {"cache-control": "max-age=10, stale-while-revalidate=30"}},
+            req("r1", 1, "/a"),
+            req("r2", 20, "/a"),   # SWR，作业 finish_at=25 待结算
+        ])
+        self.store.run(sid)
+
+        # 重启：待处理作业恢复
+        self.store.close()
+        store2 = Store(self.tmp.name)
+        self.assertEqual(len(store2.get_state(sid)["jobs"]), 1)
+
+        # no-cache 请求挂接并等待恢复的作业：只重验证一次，作业被消费
+        store2.add_event(sid, req("r3", 22, "/a",
+                                  headers={"Cache-Control": "no-cache"}))
+        out = store2.run(sid)
+        reqs = [r for r in out["results"] if r["type"] == "request"]
+        self.assertEqual(reqs[0]["verdict"], "HIT")
+        self.assertEqual(reqs[0]["job_wait"]["job_id"], "job-1")
+        self.assertEqual(reqs[0]["job_wait"]["wait_seconds"], 3)
+        c = out["counters"]
+        self.assertEqual(c["revalidations"], 1)
+        self.assertEqual(c["origin_fetches"], 2)
+        self.assertEqual(c["coalesced_requests"], 1)
+        self.assertEqual(c["origin_fetches_saved"], 1)
+        self.assertEqual(store2.get_state(sid)["jobs"], [])
+
+        # 再次重启：无残留作业，后续请求直接 HIT，不再重验证
+        store2.close()
+        store3 = Store(self.tmp.name)
+        store3.add_event(sid, req("r4", 26, "/a"))
+        out = store3.run(sid)
+        reqs = [r for r in out["results"] if r["type"] == "request"]
+        self.assertEqual(reqs[0]["verdict"], "HIT")
+        self.assertEqual(out["counters"]["revalidations"], 1)  # 没有新增
+        store3.close()
         self.store = Store(self.tmp.name)
 
 

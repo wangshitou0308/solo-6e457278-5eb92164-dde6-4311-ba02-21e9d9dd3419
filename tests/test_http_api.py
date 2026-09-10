@@ -15,8 +15,8 @@ BASE = None
 COUNTER = [8201]
 
 
-def call(method, path, body=None):
-    url = f"http://127.0.0.1:{BASE[1]}{path}"
+def call(method, path, body=None, port=None):
+    url = f"http://127.0.0.1:{port or BASE[1]}{path}"
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(
         url, data=data, method=method,

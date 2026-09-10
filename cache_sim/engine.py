@@ -778,6 +778,22 @@ class Engine:
             return self._done(counters, served, ERROR, at, url, method,
                               req_headers, trace, entry, origin_used=False)
 
+        # ---- 在途 SWR 作业：不能/不应直接返回陈旧副本的请求挂接并等待 ----
+        # 走到这里的请求未命中 SWR 分支（no-cache/must-revalidate/显式新鲜度约束
+        # 或窗口外），若同一缓存键 + Vary 变体已有在途重验证作业，则等待并复用
+        # 其结果，保证同一虚拟时刻只重验证一次。Range 与 If-Range 路径沿用现有规则。
+        if (entry is not None and not client_conditional
+                and not want_range and not force_full_get):
+            pending_job = self._find_pending_job(cache_key, entry["variant_key"])
+            if pending_job is not None:
+                waited = self._wait_for_job(counters, pending_job, at, url,
+                                            method, req_headers, req_cc, trace,
+                                            cache_key)
+                if waited is not None:
+                    return waited
+                # 作业结果不可用（条目已失效等）：按当前缓存状态继续常规路径
+                entry = self._find_variant(cache_key, req_headers)
+
         # ---- B-1：分段缓存的缺口补齐 / 陈旧区间重验证 ----
         if want_range and range_plan is not None:
             return self._range_origin_path(
@@ -1751,8 +1767,12 @@ class Engine:
     def _settle_job(self, job):
         """结算一个后台重验证作业：按当前条目验证器发条件请求并应用结果。
 
+        时间基准统一：作业在 started_at 发出重验证请求，finish_at
+        （= started_at + 调度时的源站延迟）同时是响应到达、结果生效与
+        作业结算的时刻，后续请求按虚拟时钟顺序看到一致状态。
         验证器变化 / 条目被清除时绝不复用不合规旧内容：
         304 合并进当前条目，200 经 _try_store 全量替换，5xx/故障保留陈旧条目。
+        返回结算结果文档（含 failure 失败类别，供等待该作业的请求分流）。
         """
         counters = self.state["counters"]
         counters["jobs_settled"] += 1
@@ -1767,11 +1787,14 @@ class Engine:
             entry = next((v for v in bucket["variants"]
                           if v["variant_key"] == job["variant_key"]), None)
 
+        failure = None
+        origin_status = None
         if entry is None:
             outcome, detail = "discarded", "缓存条目已不存在（被清除或替换），作业结果丢弃"
             self._trace(trace, "JOB_DISCARDED", detail)
         elif not self.state["network_up"]:
             outcome, detail = "failed", "结算时网络断开，保留陈旧条目"
+            failure = "network-down"
             counters["jobs_failed"] += 1
             counters["origin_errors"] += 1
             self._trace(trace, "JOB_FAILED", detail)
@@ -1779,14 +1802,22 @@ class Engine:
             origin = self.state["origins"].get(job["url"])
             if origin is None:
                 outcome, detail = "failed", "源站未定义资源，保留陈旧条目"
+                failure = "origin-missing"
                 counters["jobs_failed"] += 1
                 self._trace(trace, "JOB_FAILED", detail)
             elif origin.get("fail"):
                 outcome, detail = "failed", "源站连接失败（fail=true），保留陈旧条目"
+                failure = "origin-fail"
                 counters["jobs_failed"] += 1
                 counters["origin_errors"] += 1
                 self._trace(trace, "JOB_FAILED", detail)
             else:
+                eff_delay = job["finish_at"] - job["started_at"]
+                if eff_delay > 0:
+                    self._trace(trace, "ORIGIN_DELAY",
+                                f"重验证请求于 t={job['started_at']:.0f} 发出，"
+                                f"源站延迟 {eff_delay:.0f}s，响应于 t={at:.0f} 到达"
+                                "（到达即结算，延迟只计一次）")
                 fwd = {}
                 if entry["headers"].get("etag"):
                     fwd["if-none-match"] = entry["headers"]["etag"]
@@ -1794,8 +1825,10 @@ class Engine:
                     fwd["if-modified-since"] = entry["headers"]["last-modified"]
                 counters["origin_fetches"] += 1
                 counters["revalidations"] += 1
-                st, hd, bd = self._fetch_origin(origin, fwd, at, trace)
+                # delay=0：延迟已在调度时计入 finish_at，此处不再重复计
+                st, hd, bd = self._fetch_origin(origin, fwd, at, trace, delay=0)
                 self._count_origin_response(counters, st, hd, bd)
+                origin_status = st
                 if st == 304:
                     counters["not_modified"] += 1
                     self._merge_304(entry, hd, at, trace)
@@ -1804,6 +1837,7 @@ class Engine:
                     counters["jobs_failed"] += 1
                     counters["origin_errors"] += 1
                     outcome, detail = "failed", f"源站返回 {st}，保留陈旧条目（5xx 不失效缓存）"
+                    failure = "5xx"
                     self._trace(trace, "JOB_FAILED", detail)
                 else:
                     info = self._try_store(job["cache_key"],
@@ -1817,13 +1851,89 @@ class Engine:
                                            f"新响应不可缓存（{info['reason']}），旧条目已失效")
         doc = {"type": "job", "event_id": None, "job_id": job["id"], "at": at,
                "url": job["url"], "cache_key": job["cache_key"],
-               "outcome": outcome, "detail": detail,
+               "outcome": outcome, "detail": detail, "failure": failure,
+               "origin_status": origin_status,
                "attached": job["attached"], "trace": trace}
         self.state["results"].append(doc)
         log = self.state.setdefault("job_log", [])
         log.append({k: doc[k] for k in
                     ("job_id", "at", "url", "outcome", "detail", "attached")})
         del log[:-50]
+        return doc
+
+    def _wait_for_job(self, counters, job, at, url, method, req_headers, req_cc,
+                      trace, cache_key):
+        """挂接并等待在途重验证作业：立即结算（结果时间戳仍为 finish_at），
+        复用其合规结果，绝不返回不合规旧内容；作业失败时沿用既有容错规则。
+        返回 None 表示作业结果不可用（如条目已失效），调用方回退常规回源路径。
+        """
+        wait = max(0.0, job["finish_at"] - at)
+        self._trace(trace, "JOB_WAIT",
+                    f"请求不允许直接返回陈旧副本（no-cache/must-revalidate），"
+                    f"挂接在途作业 {job['id']} 并等待 {wait:.0f}s"
+                    f"（作业于 t={job['finish_at']:.0f} 结算），只重验证一次")
+        job["attached"] += 1
+        counters["coalesced_requests"] += 1
+        counters["origin_fetches_saved"] += 1
+        self.state["jobs"] = [j for j in self.state["jobs"] if j["id"] != job["id"]]
+        doc = self._settle_job(job)
+        wait_info = {"job_id": job["id"], "finish_at": job["finish_at"],
+                     "wait_seconds": wait}
+        outcome = doc["outcome"]
+        cur = self._find_variant(cache_key, req_headers)
+        if outcome in ("revalidated", "refreshed") and cur is not None:
+            age = self._entry_age(cur, at)
+            served = self._entry_response(cur, age, at)
+            self._trace(trace, "JOB_RESULT_REUSED",
+                        f"作业 {job['id']} 结算（{outcome}），复用结果返回缓存副本")
+            return self._done(counters, served, HIT, at, url, method, req_headers,
+                              trace, cur, origin_used=False, job_wait=wait_info)
+        if outcome == "failed" and cur is not None:
+            age = self._entry_age(cur, at)
+            failure = doc.get("failure")
+            if failure in ("network-down", "origin-fail"):
+                # 连接失败语义：沿用断网容错规则（声明 SIE 则受其窗口约束）
+                if self._conn_fail_fallback(cur, age, req_cc):
+                    served = self._entry_response(cur, age, at, stale=True)
+                    self._trace(trace, "JOB_FAILED_STALE",
+                                f"作业 {job['id']} 失败（{doc['detail']}），"
+                                "按连接失败容错规则回退陈旧副本")
+                    return self._done(counters, served, STALE, at, url, method,
+                                      req_headers, trace, cur, origin_used=False,
+                                      job_wait=wait_info)
+            elif failure == "5xx" and self._sie_allows(cur, age, req_cc):
+                counters["stale_if_error"] += 1
+                excess = age - (cur["ttl"] or 0.0)
+                served = self._entry_response(
+                    cur, age, at, stale=True,
+                    warning='110 cache-sim "Response is stale (stale-if-error: origin 5xx)"')
+                self._trace(trace, "STALE_IF_ERROR",
+                            f"作业 {job['id']} 遇源站 5xx，陈旧 {excess:.0f}s 在 "
+                            f"stale-if-error={cur['sie']:.0f}s 窗口内，回退陈旧副本")
+                return self._done(counters, served, STALE_IF_ERROR, at, url,
+                                  method, req_headers, trace, cur,
+                                  origin_used=False,
+                                  stale_info={"kind": "stale-if-error",
+                                              "window": cur["sie"],
+                                              "excess": excess,
+                                              "origin_status": doc.get("origin_status")},
+                                  job_wait=wait_info)
+            status = 502 if failure == "origin-missing" else 504
+            self._trace(trace, "JOB_FAILED_NO_FALLBACK",
+                        f"作业 {job['id']} 失败（{doc['detail']}），且 "
+                        "must-revalidate/no-cache 禁止陈旧兜底，"
+                        f"返回 {status}")
+            served = self._gateway_error(
+                status, f"{'Bad Gateway' if status == 502 else 'Gateway Timeout'}"
+                        " (revalidation job failed, stale forbidden)")
+            return self._done(counters, served, ERROR, at, url, method,
+                              req_headers, trace, cur, origin_used=False,
+                              job_wait=wait_info)
+        # invalidated / discarded / 变体缺失：结果不可用，回退常规回源路径
+        self._trace(trace, "JOB_RESULT_UNUSABLE",
+                    f"作业 {job['id']} 结果不可用（{doc['outcome']}: {doc['detail']}），"
+                    "回退常规回源路径")
+        return None
 
     # ---- 源站模拟 --------------------------------------------------------
 
@@ -1837,8 +1947,11 @@ class Engine:
         except (TypeError, ValueError):
             return 0.0
 
-    def _fetch_origin(self, origin, fwd_headers, at, trace):
-        delay = self._origin_delay(origin)
+    def _fetch_origin(self, origin, fwd_headers, at, trace, delay=None):
+        # delay=None：按源站当前定义计延迟；后台作业结算时传 0
+        # （延迟已在调度时计入 finish_at，到达时刻即结算时刻）
+        if delay is None:
+            delay = self._origin_delay(origin)
         if delay > 0:
             self._trace(trace, "ORIGIN_DELAY",
                         f"源站响应延迟 {delay:.0f}s（虚拟时间），响应于 t={at + delay:.0f} 到达")
@@ -2096,7 +2209,7 @@ class Engine:
     def _done(self, counters, served, verdict, at, url, method, req_headers,
               trace, entry, origin_used, origin_status=None, origin_resp=None,
               range_info=None, origin_bytes=None, stale_info=None,
-              origin_delay=None):
+              origin_delay=None, job_wait=None):
         served_body = served.get("body", b"")
         counters["bytes_served"] += wire_size(
             served["status"], served["headers"], served_body)
@@ -2143,6 +2256,8 @@ class Engine:
             out["stale_info"] = stale_info
         if origin_delay:
             out["origin_delay"] = origin_delay
+        if job_wait is not None:
+            out["job_wait"] = job_wait
         return out
 
     @staticmethod
