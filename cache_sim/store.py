@@ -8,7 +8,7 @@ import sqlite3
 import threading
 import uuid
 
-from .engine import DEFAULT_CONFIG, Engine, new_state, norm_body
+from .engine import DEFAULT_CONFIG, Engine, new_state, norm_body, to_json, from_json
 
 VALID_EVENT_TYPES = {"origin", "origin_change", "network", "clear", "request"}
 
@@ -179,7 +179,7 @@ class Store:
             self._conn.execute(
                 "INSERT INTO events(scenario_id, event_id, type, at, payload, seq) "
                 "VALUES (?,?,?,?,?,?)",
-                (sid, eid, etype, at, json.dumps(payload, ensure_ascii=False), seq))
+                (sid, eid, etype, at, to_json(payload), seq))
             self._conn.commit()
         return {"id": eid, "seq": seq, "event": payload}
 
@@ -201,7 +201,7 @@ class Store:
                 "SELECT event_id, type, at, payload, seq FROM events "
                 "WHERE scenario_id=? ORDER BY seq", (sid,)).fetchall()
         return [{"seq": r["seq"], "id": r["event_id"], "type": r["type"],
-                 "at": r["at"], **json.loads(r["payload"])} for r in rows]
+                 "at": r["at"], **from_json(r["payload"])} for r in rows]
 
     def delete_event(self, sid: str, event_id: str) -> bool:
         with self._lock:
@@ -216,14 +216,14 @@ class Store:
         with self._lock:
             r = self._conn.execute(
                 "SELECT state FROM states WHERE scenario_id=?", (sid,)).fetchone()
-        return json.loads(r["state"]) if r else None
+        return from_json(r["state"]) if r else None
 
     def save_state(self, sid: str, state: dict):
         import time
         with self._lock:
             self._conn.execute(
                 "INSERT OR REPLACE INTO states(scenario_id, state, updated_at) VALUES (?,?,?)",
-                (sid, json.dumps(state, ensure_ascii=False), time.time()))
+                (sid, to_json(state), time.time()))
             self._conn.commit()
 
     def reset(self, sid: str) -> dict:
@@ -260,7 +260,7 @@ class Store:
                 continue
             if until is not None and float(r["at"]) > float(until):
                 continue
-            pending.append((r["seq"], json.loads(r["payload"])))
+            pending.append((r["seq"], from_json(r["payload"])))
 
         results = []
         for _, payload in pending:

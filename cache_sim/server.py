@@ -250,6 +250,11 @@ class Handler(BaseHTTPRequestHandler):
                 "delta_bytes_from_origin": c1["bytes_from_origin"] - c0["bytes_from_origin"],
                 "delta_hits": c1["hits"] - c0["hits"],
                 "delta_errors": c1["errors"] - c0["errors"],
+                "delta_range_fills": c1.get("range_fills", 0) - c0.get("range_fills", 0),
+                "delta_range_hits": c1.get("range_hits", 0) - c0.get("range_hits", 0),
+                "delta_range_bytes_from_origin": (
+                    c1.get("range_bytes_from_origin", 0)
+                    - c0.get("range_bytes_from_origin", 0)),
                 "same_verdict_sequence": base["verdicts"] == it["verdicts"],
             })
         self._send(200, {"items": items, "comparisons": rows})
@@ -268,6 +273,19 @@ class Handler(BaseHTTPRequestHandler):
                     age = now - v["stored_at"] + v.get("init_age", 0)
                     ttl = v["ttl"]
                     fresh = (not v["no_cache"] and ttl is not None and age <= ttl)
+                    partial = v.get("partial", False)
+                    if partial:
+                        segments = [[s["start"], s["end"]] for s in v.get("segments", [])]
+                        cached_bytes = sum(e - s + 1 for s, e in segments)
+                        length = v.get("length", 0)
+                        body_bytes = cached_bytes
+                    else:
+                        body = v.get("body", b"")
+                        segments = None
+                        length = v.get("length",
+                                      len(body) if isinstance(body, bytes) else len(str(body)))
+                        cached_bytes = length
+                        body_bytes = length
                     variants.append({
                         "variant_key": v["variant_key"],
                         "status": v["status"],
@@ -278,8 +296,13 @@ class Handler(BaseHTTPRequestHandler):
                         "must_revalidate": v["must_revalidate"],
                         "etag": v["headers"].get("etag"),
                         "last_modified": v["headers"].get("last-modified"),
-                        "body_bytes": (len(v["body"].encode("utf-8"))
-                                       if isinstance(v["body"], str) else len(v["body"])),
+                        "accept_ranges": v["headers"].get("accept-ranges"),
+                        "partial": partial,
+                        "length": length,
+                        "segments": segments,
+                        "cached_bytes": cached_bytes,
+                        "coverage_pct": round(cached_bytes / length, 4) if length else None,
+                        "body_bytes": body_bytes,
                     })
                 cache_view.append({"key": key, "vary": bucket.get("vary", []),
                                    "variants": variants})
@@ -309,13 +332,16 @@ class Handler(BaseHTTPRequestHandler):
 
     @staticmethod
     def _origin_summary(d):
-        body = d.get("body", "")
+        body = d.get("body", b"")
+        n = len(body) if isinstance(body, (bytes, bytearray)) else len(str(body).encode("utf-8"))
         return {
             "status": d["status"],
             "etag": d["headers"].get("etag"),
             "last_modified": d["headers"].get("last-modified"),
             "cache_control": d["headers"].get("cache-control"),
-            "body_bytes": len(body.encode("utf-8")) if isinstance(body, str) else len(body),
+            "accept_ranges": d.get("accept_ranges",
+                                   d["headers"].get("accept-ranges")),
+            "body_bytes": n,
         }
 
 

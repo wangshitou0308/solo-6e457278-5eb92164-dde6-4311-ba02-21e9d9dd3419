@@ -5,6 +5,9 @@
     must-revalidate / proxy-revalidate / Expires / ETag / Last-Modified / Vary
   * 请求指令：no-cache / no-store / max-age / max-stale / min-fresh / only-if-cached
   * 条件请求：If-None-Match / If-Modified-Since 与 304 合并
+  * 字节范围：单区间 Range / If-Range / 206 / 416，分段缓存（部分响应）、
+    相邻/重叠片段合并（强 ETag 或 Last-Modified 一致才允许）、缺口回源补齐、
+    验证器变化后丢弃旧片段
   * 共享 / 私有缓存模式（s-maxage、private 仅在共享模式生效）
   * 启发式过期（Last-Modified 年龄比例）
   * 断网失败路径：must-revalidate -> 504；普通陈旧响应允许继续使用
@@ -12,6 +15,7 @@
 
 from __future__ import annotations
 
+import base64
 import copy
 import json
 from email.utils import parsedate
@@ -21,13 +25,15 @@ DEFAULT_CONFIG = {
     # shared：共享缓存（代理），private 指令不可缓存、s-maxage 生效
     # private：浏览器类私有缓存，private 可缓存、忽略 s-maxage
     "cache_mode": "shared",
+    # 是否启用分段（字节范围）缓存：关闭时不保存/合 206 部分响应
+    "range_cache": True,
     # 无显式新鲜度时，是否按 Last-Modified 年龄比例做启发式缓存
     "heuristic_cache": False,
     "heuristic_ratio": 0.1,
     "heuristic_min": 0,
     "heuristic_max": 86400,
-    # 可缓存的源站状态码
-    "cacheable_statuses": [200, 203, 301, 304, 404, 410],
+    # 可缓存的源站状态码（206 部分响应默认可缓存）
+    "cacheable_statuses": [200, 203, 206, 301, 304, 404, 410],
     # 既无 Cache-Control/Expires，也无 ETag/Last-Modified 时是否缓存
     "cache_without_explicit": False,
     # 响应缺少 Cache-Control 时注入的缺省指令，例如 {"max-age": 60}
@@ -38,7 +44,7 @@ DEFAULT_CONFIG = {
 }
 
 # 判定结果枚举
-HIT = "HIT"                        # 新鲜缓存直接命中
+HIT = "HIT"                        # 新鲜缓存直接命中（完整 200）
 MISS = "MISS"                      # 回源获得完整响应并写入缓存
 REVALIDATED = "REVALIDATED"        # 条件重验证得到 304，继续使用缓存副本
 REFRESHED = "REFRESHED"            # 重验证/过期回源得到完整新响应，缓存被更新
@@ -46,6 +52,41 @@ NOT_MODIFIED = "NOT_MODIFIED"      # 客户端自带条件请求，源站直接 
 UNCACHEABLE = "UNCACHEABLE"        # 回源成功但响应不允许缓存
 STALE = "STALE"                    # 断网时使用了陈旧副本
 ERROR = "ERROR"                    # 断网且无法满足（504/502）
+RANGE_HIT = "RANGE_HIT"            # 请求区间全部被已缓存片段覆盖，直接 206
+RANGE_FILL = "RANGE_FILL"          # 区间有缺口，回源补齐后返回 206（含首次 206）
+UNSATISFIABLE = "UNSATISFIABLE"    # 范围不可满足，416
+
+# 状态 JSON 中 bytes 的编解码标记（状态可整体落 SQLite，重启后恢复）
+BYTES_KEY = "__bytes_b64__"
+
+
+def to_b64(b: bytes) -> str:
+    return base64.b64encode(b).decode("ascii")
+
+
+def from_b64(s: str) -> bytes:
+    return base64.b64decode(s.encode("ascii"), validate=True)
+
+
+def _json_default(o):
+    if isinstance(o, (bytes, bytearray)):
+        return {BYTES_KEY: to_b64(bytes(o))}
+    raise TypeError(f"Object of type {type(o).__name__} is not JSON serializable")
+
+
+def _json_hook(d):
+    if set(d.keys()) == {BYTES_KEY}:
+        return from_b64(d[BYTES_KEY])
+    return d
+
+
+def to_json(obj) -> str:
+    """状态/事件落库用的 JSON：bytes 以 base64 标记无损保存。"""
+    return json.dumps(obj, ensure_ascii=False, default=_json_default)
+
+
+def from_json(s):
+    return json.loads(s, object_hook=_json_hook)
 
 
 def new_state() -> dict:
@@ -65,6 +106,15 @@ def new_state() -> dict:
             "errors": 0,
             "bytes_served": 0,
             "bytes_from_origin": 0,
+            # 字节范围相关
+            "range_requests": 0,            # 携带单区间 Range 的 GET 请求数
+            "range_hits": 0,                # 完全由缓存片段满足的 206 次数
+            "range_fills": 0,               # 回源补缺口的 206 次数
+            "unsatisfiable": 0,             # 416 次数
+            "range_fetches": 0,             # 回源 Range 子请求次数
+            "range_bytes_from_origin": 0,   # 回源拿到的 206 响应体字节
+            "segments_merged": 0,           # 片段合并次数
+            "segments_invalidated": 0,      # 验证器变化丢弃片段的次数
         },
         "results": [],
         "executed_event_ids": [],
@@ -123,26 +173,38 @@ def parse_time_value(value, default=None):
     return float(timegm(parsed))
 
 
+def body_len(body) -> int:
+    if body is None:
+        return 0
+    if isinstance(body, str):
+        return len(body.encode("utf-8"))
+    return len(body)
+
+
 def wire_size(status: int, headers: dict, body) -> int:
     """仿真估算一次 HTTP 响应在线传输的字节数（状态行 + 响应头 + 响应体）。"""
     n = len(f"HTTP/1.1 {status}\r\n")
     for k, v in headers.items():
         n += len(f"{k}: {v}\r\n")
     n += 2
-    if body is not None:
-        n += len(body.encode("utf-8")) if isinstance(body, str) else len(body)
+    n += body_len(body)
     return n
 
 
-def norm_body(body):
-    # 状态需要 JSON 持久化，body 统一为字符串
+def norm_body(body=None, body_base64=None) -> bytes:
+    """事件中的资源体统一成 bytes：优先 body_base64（二进制），否则 UTF-8 文本。"""
+    if body_base64 is not None:
+        try:
+            return from_b64(str(body_base64))
+        except Exception as e:
+            raise ValueError(f"body_base64 不是合法的 Base64: {e}") from e
     if body is None:
-        return ""
-    if isinstance(body, bytes):
-        return body.decode("utf-8", "replace")
+        return b""
+    if isinstance(body, (bytes, bytearray)):
+        return bytes(body)
     if isinstance(body, str):
-        return body
-    return json.dumps(body, ensure_ascii=False)
+        return body.encode("utf-8")
+    return json.dumps(body, ensure_ascii=False).encode("utf-8")
 
 
 def _variant_key(selected: dict) -> str:
@@ -155,6 +217,10 @@ def _etag_values(header: str):
     return [x.strip() for x in header.split(",") if x.strip()]
 
 
+def _is_strong_etag(tag: str | None) -> bool:
+    return bool(tag) and not tag.strip().upper().startswith("W/")
+
+
 def _etag_weak_equal(a: str, b: str) -> bool:
     """弱比较：剥掉 W/ 前缀后相等即可（RFC 7232）。"""
     if not a or not b:
@@ -162,6 +228,98 @@ def _etag_weak_equal(a: str, b: str) -> bool:
     na = a.strip().upper().removeprefix("W/")
     nb = b.strip().upper().removeprefix("W/")
     return na == nb
+
+
+def _etag_strong_equal(a: str | None, b: str | None) -> bool:
+    """强比较：两边都必须是强 ETag 且逐字相等（RFC 7232，片段合并要求）。"""
+    if not _is_strong_etag(a) or not _is_strong_etag(b):
+        return False
+    return a.strip() == b.strip()
+
+
+def _lm_equal(a: str | None, b: str | None) -> bool:
+    ta, tb = parse_time_value(a), parse_time_value(b)
+    return ta is not None and tb is not None and ta == tb
+
+
+def same_representation(h1: dict, h2: dict) -> tuple[bool, str]:
+    """确认两份表示是否同一版本：优先强 ETag，其次 Last-Modified。
+
+    返回 (是否一致, 依据说明)。无法确认（弱 ETag / 都缺失）一律按不一致处理。
+    """
+    e1, e2 = h1.get("etag"), h2.get("etag")
+    if _is_strong_etag(e1) and _is_strong_etag(e2):
+        ok = _etag_strong_equal(e1, e2)
+        return ok, f"强 ETag {e1} {'==' if ok else '!='} {e2}"
+    l1, l2 = h1.get("last-modified"), h2.get("last-modified")
+    if l1 and l2:
+        ok = _lm_equal(l1, l2)
+        return ok, f"Last-Modified {l1} {'==' if ok else '!='} {l2}"
+    have = []
+    if e1 or e2:
+        have.append("ETag 为弱验证器，不能用于片段合并")
+    if not (l1 and l2):
+        have.append("缺少 Last-Modified")
+    return False, "无法确认表示一致（" + "；".join(have) + "）"
+
+
+# ---------------------------------------------------------------- Range 解析
+
+def parse_range_spec(header: str):
+    """语法解析单区间 Range（不依赖资源长度）。
+
+    返回 ("range", start, end, suffix)：start/end 可能为 None（open-ended），
+    suffix 为 bytes=-N 形式的 N；("multi", None) 多区间（不支持，按普通 GET 转发）；
+    ("invalid", None) 非法头（RFC 要求忽略，按普通 GET 处理）。
+    """
+    s = str(header).strip()
+    if not s.lower().startswith("bytes="):
+        return ("invalid", None)
+    spec = s[len("bytes="):].strip()
+    if "," in spec:
+        return ("multi", None)
+    if spec.count("-") != 1:
+        return ("invalid", None)
+    a, b = spec.split("-")
+    a, b = a.strip(), b.strip()
+    if a == "" and b == "":
+        return ("invalid", None)
+    try:
+        if a == "":  # bytes=-N：最后 N 字节
+            return ("range", None, None, int(b))
+        start = int(a)
+        end = int(b) if b else None
+        if start < 0 or (end is not None and end < start):
+            return ("invalid", None)
+        return ("range", start, end, None)
+    except ValueError:
+        return ("invalid", None)
+
+
+def resolve_range(spec, length: int):
+    """把语法区间解析成闭区间 [first, last]；不可满足返回 None。"""
+    _, start, end, suffix = spec
+    if suffix is not None:
+        if suffix <= 0 or length == 0:
+            return None
+        n = min(suffix, length)
+        return length - n, length - 1
+    first = start
+    last = length - 1 if end is None else min(end, length - 1)
+    if length == 0 or first >= length or first > last:
+        return None
+    return first, last
+
+
+def parse_content_range(value: str):
+    """解析 Content-Range: bytes start-end/total，返回 (start, end, total)。"""
+    try:
+        s = str(value).strip().lower().removeprefix("bytes").strip()
+        rng, _, total = s.partition("/")
+        a, b = rng.split("-")
+        return int(a), int(b), int(total)
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------- 引擎
@@ -174,7 +332,16 @@ class Engine:
         self.state = new_state()
 
     def load_state(self, state: dict):
-        self.state = copy.deepcopy(state)
+        # 兼容旧版本状态：补齐新增计数器/条目字段
+        state = copy.deepcopy(state)
+        defaults = new_state()
+        for k, v in defaults["counters"].items():
+            state.setdefault("counters", {}).setdefault(k, v)
+        state.setdefault("origins", {})
+        state.setdefault("cache", {})
+        state.setdefault("results", [])
+        state.setdefault("executed_event_ids", [])
+        self.state = state
 
     # ---- 事件入口 --------------------------------------------------------
 
@@ -206,6 +373,17 @@ class Engine:
 
     # ---- 源站定义 / 变更 -------------------------------------------------
 
+    def _accept_ranges(self, event, headers) -> str:
+        """归一化源站是否支持范围：'bytes' 或 'none'。默认支持（静态源站语义）。"""
+        val = event.get("accept_ranges")
+        if val is None:
+            val = headers.get("accept-ranges")
+        if val is None:
+            return "bytes"
+        if isinstance(val, bool):
+            return "bytes" if val else "none"
+        return "bytes" if str(val).strip().lower() != "none" else "none"
+
     def _origin_def(self, event: dict):
         url = event.get("url")
         if not url:
@@ -215,10 +393,14 @@ class Engine:
             headers["etag"] = str(event["etag"])
         if event.get("last_modified") is not None and "last-modified" not in headers:
             headers["last-modified"] = str(event["last_modified"])
+        ar = self._accept_ranges(event, headers)
+        if "accept-ranges" not in headers:
+            headers["accept-ranges"] = ar
         return url, {
             "status": int(event.get("status", 200)),
             "headers": headers,
-            "body": norm_body(event.get("body", "")),
+            "body": norm_body(event.get("body", ""), event.get("body_base64")),
+            "accept_ranges": ar,
         }
 
     def _apply_origin(self, event, at):
@@ -232,8 +414,8 @@ class Engine:
             raise ValueError(f"origin_change 需要先用 origin 事件定义资源: {url!r}")
         cur = self.state["origins"][url]
         before = self._resource_summary(cur)
-        if event.get("body") is not None:
-            cur["body"] = norm_body(event["body"])
+        if event.get("body") is not None or event.get("body_base64") is not None:
+            cur["body"] = norm_body(event.get("body"), event.get("body_base64"))
         if event.get("status") is not None:
             cur["status"] = int(event["status"])
         if event.get("headers"):
@@ -245,18 +427,24 @@ class Engine:
             cur["headers"]["etag"] = str(event["etag"])
         if event.get("last_modified") is not None:
             cur["headers"]["last-modified"] = str(event["last_modified"])
+        if event.get("accept_ranges") is not None:
+            cur["accept_ranges"] = ("bytes" if event["accept_ranges"]
+                                    else "none") if isinstance(
+                event["accept_ranges"], bool) else str(event["accept_ranges"]).strip().lower()
+            cur["headers"]["accept-ranges"] = cur["accept_ranges"]
         return {"type": "origin_change", "at": at, "url": url,
                 "before": before, "after": self._resource_summary(cur)}
 
     @staticmethod
     def _resource_summary(d):
-        body = d.get("body", "")
         return {
             "status": d["status"],
             "etag": d["headers"].get("etag"),
             "last_modified": d["headers"].get("last-modified"),
             "cache_control": d["headers"].get("cache-control"),
-            "body_bytes": len(body.encode("utf-8")) if isinstance(body, str) else len(body),
+            "accept_ranges": d.get("accept_ranges",
+                                   d["headers"].get("accept-ranges")),
+            "body_bytes": body_len(d.get("body", b"")),
         }
 
     # ---- 网络 / 清除 -----------------------------------------------------
@@ -305,6 +493,25 @@ class Engine:
         log("REQUEST", f"{method} {url}")
         if req_cc:
             log("REQUEST_CC", f"请求 Cache-Control: {dict(req_cc)}")
+
+        # Range 语法解析（只支持单区间；多区间/非法头按普通 GET 处理）
+        range_spec = None
+        if method == "GET" and "range" in req_headers:
+            parsed = parse_range_spec(req_headers["range"])
+            if parsed[0] == "range":
+                range_spec = parsed
+                counters["range_requests"] += 1
+                log("RANGE_REQUEST", f"单区间 Range: {req_headers['range']}")
+            elif parsed[0] == "multi":
+                log("RANGE_MULTI_UNSUPPORTED",
+                    f"多区间 Range {req_headers['range']} 超出仿真范围，按完整 GET 转发")
+            else:
+                log("RANGE_PARSE_IGNORE",
+                    f"非法 Range {req_headers['range']}，RFC 要求忽略，按完整 GET 处理")
+        want_range = range_spec is not None
+        if_range = req_headers.get("if-range")
+        if if_range is not None:
+            log("IF_RANGE", f"请求带 If-Range: {if_range}")
         if client_conditional:
             log("CLIENT_CONDITIONAL", "客户端自带条件请求，将转发到源站")
 
@@ -315,11 +522,25 @@ class Engine:
             if entry is not None:
                 age = self._entry_age(entry, at)
                 stale = not self._is_fresh(entry, age)
+                if want_range:
+                    served, rinfo = self._serve_cached_range(
+                        entry, range_spec, age, at, stale=stale)
+                    if served is not None:
+                        log("ONLY_IF_CACHED",
+                            f"only-if-cached：区间已被缓存片段覆盖，直接返回 206（age={age:.0f}s）")
+                        return self._done(counters, served, RANGE_HIT, at, url, method,
+                                          req_headers, trace, entry, origin_used=False,
+                                          range_info=rinfo)
+                    log("ONLY_IF_CACHED_FAIL",
+                        "only-if-cached 且缓存片段存在缺口，返回 504（不回源）")
+                    served = self._gateway_error(
+                        504, "Gateway Timeout (only-if-cached, range not fully cached)")
+                    return self._done(counters, served, ERROR, at, url, method,
+                                      req_headers, trace, entry, origin_used=False)
                 served = self._entry_response(entry, age, at, stale=stale)
                 log("ONLY_IF_CACHED",
                     f"only-if-cached：直接返回缓存副本（age={age:.0f}s，{'陈旧' if stale else '新鲜'}）")
-                verdict = HIT
-                return self._done(counters, served, verdict, at, url, method,
+                return self._done(counters, served, HIT, at, url, method,
                                   req_headers, trace, entry, origin_used=False)
             log("ONLY_IF_CACHED_FAIL", "only-if-cached 但无缓存变体，返回 504（不回源）")
             served = self._gateway_error(504, "Gateway Timeout (only-if-cached, no cached entry)")
@@ -334,25 +555,152 @@ class Engine:
             if entry is None:
                 log("VARY_MISMATCH", "存在缓存但 Vary 选择的请求头不匹配任何变体")
 
-        # 客户端自带条件请求（If-None-Match / If-Modified-Since）：不做新鲜度短路，
-        # 一律转发源站；entry 保留用于合并 304 元数据
         if entry is None and not client_conditional:
             log("CACHE_MISS", "没有可用缓存条目（或请求 no-store / Vary 不匹配）")
 
+        # range_plan：新鲜区间命中在此直接返回；其余情况交给路径 B
+        # 取值：None / ("validate-covered", ...) / ("gaps", ...)
+        range_plan = None
+        force_full_get = False     # If-Range 明确不匹配：丢弃 Range，完整回源
+        full_get = False  # 完整 GET 命中仅含片段的条目：补齐后返回完整 200
         if entry is not None and not client_conditional:
             age = self._entry_age(entry, at)
             log("CACHE_ENTRY",
                 f"age={age:.0f}s ttl={self._fmt_ttl(entry)} no_cache={entry['no_cache']} "
-                f"must_revalidate={entry['must_revalidate']}")
+                f"must_revalidate={entry['must_revalidate']}"
+                + (f" partial={entry.get('partial', False)} "
+                   f"segments={self._segments_view(entry)}"
+                   if (want_range or entry.get("partial")) else ""))
             decision = self._freshness_decision(entry, age, req_cc, trace)
-            if decision == "fresh":
+
+            # 完整 GET 命中“只有部分片段”的条目：把请求当作 [0, length-1] 区间
+            if not want_range and entry.get("partial"):
+                want_range = True
+                interval = (0, entry["length"] - 1)
+                covered, gaps = self._coverage(entry, *interval)
+                rinfo_base = {"requested": None, "full_get": True,
+                              "first": 0, "last": entry["length"] - 1,
+                              "length": entry["length"], "covered": covered, "gaps": gaps,
+                              "segments_before": self._segments_view(entry)}
+                if not gaps and decision == "fresh":
+                    # 片段已拼满（理论上 partial 已升级，留作防御）
+                    served = self._entry_response(entry, age, at)
+                    log("PARTIAL_COMPLETE_HIT", "片段已覆盖完整表示，直接返回 200")
+                    return self._done(counters, served, HIT, at, url, method,
+                                      req_headers, trace, entry, origin_used=False,
+                                      range_info={**rinfo_base, "served_from": "cache"})
+                range_plan = ("gaps", entry, interval, gaps, rinfo_base,
+                              decision != "fresh", age, True)
+                log("PARTIAL_FULL_GET",
+                    f"完整 GET 但缓存只有片段，缺口 {gaps}，回源补齐后返回完整 200"
+                    if gaps else "完整 GET，片段覆盖完整表示但需重验证")
+            elif want_range:
+                interval = resolve_range(range_spec, entry["length"])
+                if interval is None:
+                    # 相对已知表示长度不可满足：缓存可直接生成 416
+                    served = self._range_416(entry["length"])
+                    counters["unsatisfiable"] += 1
+                    log("RANGE_416",
+                        f"请求区间相对缓存长度 {entry['length']} 不可满足，返回 416（不回源）")
+                    return self._done(counters, served, UNSATISFIABLE, at, url, method,
+                                      req_headers, trace, entry, origin_used=False,
+                                      range_info={"requested": req_headers["range"],
+                                                  "length": entry["length"],
+                                                  "served_from": "cache"})
+
+                # 客户端 If-Range 与缓存验证器比较（只需判定一次）
+                ir = None
+                if if_range is not None:
+                    ir = self._if_range_matches(if_range, entry["headers"])
+                    if ir is False:
+                        log("IF_RANGE_MISMATCH",
+                            f"If-Range {if_range} 与缓存验证器不一致，"
+                            "忽略 Range 回源请求完整表示")
+                    elif ir:
+                        log("IF_RANGE_MATCH",
+                            f"If-Range {if_range} 与缓存验证器一致，按区间处理")
+                    else:
+                        log("IF_RANGE_UNKNOWN", "缓存无可用验证器，If-Range 交源站判定")
+
+                # 明确不匹配：直接走完整 GET 路径（剥离 Range）
+                if ir is False:
+                    force_full_get = True
+                    want_range = False
+                else:
+                    covered, gaps = self._coverage(entry, *interval)
+                    rinfo_base = {"requested": req_headers["range"], "first": interval[0],
+                                  "last": interval[1], "length": entry["length"],
+                                  "covered": covered, "gaps": gaps,
+                                  "segments_before": self._segments_view(entry)}
+                    if not gaps:
+                        if decision == "fresh":
+                            served, rinfo = self._serve_cached_range(
+                                entry, range_spec, age, at)
+                            rinfo = {**rinfo_base, **rinfo, "served_from": "cache"}
+                            log("RANGE_COVERED",
+                                f"区间 [{interval[0]},{interval[1]}] 全部被缓存片段覆盖，"
+                                "直接返回 206（命中区间=%s）" % covered)
+                            return self._done(counters, served, RANGE_HIT, at, url, method,
+                                              req_headers, trace, entry, origin_used=False,
+                                              range_info=rinfo)
+                        # 已陈旧但区间完整覆盖：需要条件重验证
+                        range_plan = ("validate-covered", entry, interval, rinfo_base, age)
+                    else:
+                        need_validate = decision != "fresh"
+                        # 重新选取条目：覆盖区间的判定过程中条目可能已被此前事件替换
+                        entry = self._find_variant(cache_key, req_headers) or entry
+                        range_plan = ("gaps", entry, interval, gaps, rinfo_base,
+                                      need_validate, age, False)
+                        if need_validate:
+                            log("RANGE_GAPS_STALE",
+                                f"区间缺口 {gaps} 且缓存需重验证，"
+                                "将带 If-Range 回源补齐（验证器变化则源站返回完整 200）")
+                        else:
+                            log("RANGE_GAPS", f"区间缺口 {gaps}，只需回源补齐缺失字节")
+            elif decision == "fresh":
                 served = self._entry_response(entry, age, at)
                 return self._done(counters, served, HIT, at, url, method,
                                   req_headers, trace, entry, origin_used=False)
             # stale-ok / stale-must：在线回源重验证，断网在路径 B 分流
 
-        # ---- 路径 B：回源（MISS / 重验证 / 客户端条件请求） ----
+        # ---- 路径 B：回源（MISS / 重验证 / 区间补齐 / 客户端条件请求） ----
         if not self.state["network_up"]:
+            if want_range and range_plan is not None and range_plan[0] == "validate-covered":
+                _, entry, interval, rinfo_base, _ = range_plan
+                if not self._must_not_serve_stale(entry, req_cc):
+                    age = self._entry_age(entry, at)
+                    served, rinfo = self._serve_cached_range(
+                        entry, range_spec, age, at, stale=True, interval=interval)
+                    rinfo = {**rinfo_base, **rinfo, "served_from": "cache-stale"}
+                    log("NETWORK_DOWN_STALE",
+                        "网络断开，使用陈旧缓存片段返回 206（带 Warning: 110）")
+                    return self._done(counters, served, STALE, at, url, method,
+                                      req_headers, trace, entry, origin_used=False,
+                                      range_info=rinfo)
+                log("NETWORK_DOWN_FAIL",
+                    "网络断开，区间虽被陈旧片段覆盖但 must-revalidate/no-cache 禁止兜底，返回 504")
+                served = self._gateway_error(504, "Gateway Timeout (stale range must revalidate)")
+                return self._done(counters, served, ERROR, at, url, method,
+                                  req_headers, trace, entry, origin_used=False)
+            if want_range and range_plan is not None:
+                # gaps（含完整 GET 只有片段）：缺字节断网无法补齐
+                plan_entry = range_plan[1]
+                if range_plan[7]:
+                    # 完整 GET 上的陈旧片段：允许 STALE 兜底（返回不完整内容，trace 标注）
+                    if not self._must_not_serve_stale(plan_entry, req_cc):
+                        age = self._entry_age(plan_entry, at)
+                        served = self._entry_response(plan_entry, age, at, stale=True)
+                        log("NETWORK_DOWN_STALE",
+                            "网络断开，完整 GET 仅有部分片段，按陈旧副本兜底（内容不完整，已带 Warning: 110）")
+                        return self._done(counters, served, STALE, at, url, method,
+                                          req_headers, trace, plan_entry, origin_used=False,
+                                          range_info={"full_get": True, "incomplete": True,
+                                                      "gaps": range_plan[3]})
+                log("NETWORK_DOWN_FAIL",
+                    "网络断开且请求区间未被缓存片段完整覆盖（存在缺口），返回 504")
+                served = self._gateway_error(504, "Gateway Timeout (range gaps, network down)")
+                return self._done(counters, served, ERROR, at, url, method,
+                                  req_headers, trace, plan_entry, origin_used=False)
             if entry is not None and not self._must_not_serve_stale(entry, req_cc):
                 age = self._entry_age(entry, at)
                 served = self._entry_response(entry, age, at, stale=True)
@@ -364,10 +712,25 @@ class Engine:
             return self._done(counters, served, ERROR, at, url, method,
                               req_headers, trace, entry, origin_used=False)
 
+        origin = self.state["origins"].get(url)
+
+        # ---- B-1：分段缓存的缺口补齐 / 陈旧区间重验证 ----
+        if want_range and range_plan is not None:
+            return self._range_origin_path(
+                range_plan, origin, url, method, at, req_headers, req_cc,
+                req_no_store, if_range, trace, counters, cache_key)
+
         # 构造发往源站的请求头；重验证时附加缓存验证器
         forwarded = dict(req_headers)
+
+        # 客户端 If-Range 与缓存验证器明确不符：完整回源（剥离 Range/If-Range）
+        strip_range = force_full_get
+        if strip_range:
+            forwarded.pop("range", None)
+            forwarded.pop("if-range", None)
+
         conditional_sent = False
-        if entry is not None and not client_conditional:
+        if entry is not None and not client_conditional and not strip_range:
             age = self._entry_age(entry, at)
             if entry["headers"].get("etag"):
                 forwarded["if-none-match"] = entry["headers"]["etag"]
@@ -380,7 +743,6 @@ class Engine:
             else:
                 log("REVALIDATE_NONE", "条目没有 ETag/Last-Modified，只能完整回源")
 
-        origin = self.state["origins"].get(url)
         counters["origin_fetches"] += 1
         if conditional_sent:
             counters["revalidations"] += 1
@@ -392,23 +754,22 @@ class Engine:
                               origin_status=502, origin_resp=served)
 
         origin_status, origin_headers, origin_body = self._fetch_origin(
-            origin, forwarded, at, trace
-        )
+            origin, forwarded, at, trace)
         origin_resp = {"status": origin_status, "headers": origin_headers, "body": origin_body}
-        counters["bytes_from_origin"] += wire_size(origin_status, origin_headers, origin_body)
+        self._count_origin_response(counters, origin_status, origin_headers, origin_body,
+                                    range_hdr=forwarded.get("range"))
 
         # ---- 304 ----
         if origin_status == 304:
             counters["not_modified"] += 1
             if client_conditional:
-                # 客户端自带条件请求：把 304 原样交给客户端；顺带刷新已有条目元数据
                 if entry is not None:
                     self._merge_304(entry, origin_headers, at, trace)
                 log("CLIENT_NOT_MODIFIED", "源站 304：透传给客户端")
                 return self._done(counters, origin_resp, NOT_MODIFIED, at, url, method,
                                   req_headers, trace, entry, origin_used=True,
                                   origin_status=304, origin_resp=origin_resp)
-            if entry is not None:
+            if entry is not None and not entry.get("partial"):
                 self._merge_304(entry, origin_headers, at, trace)
                 age = self._entry_age(entry, at)
                 served = self._entry_response(entry, age, at)
@@ -416,15 +777,61 @@ class Engine:
                 return self._done(counters, served, REVALIDATED, at, url, method,
                                   req_headers, trace, entry, origin_used=True,
                                   origin_status=304, origin_resp=origin_resp)
-            log("CLIENT_NOT_MODIFIED", "无缓存条目却收到 304，原样透传")
+            if entry is not None and entry.get("partial") and "range" not in forwarded:
+                # 缓存里只有部分片段，非区间 GET 不能凭 304 返回空 200：
+                # 去掉条件头完整回源一次
+                log("PARTIAL_304_FULL",
+                    "源站 304 但缓存仅有部分片段且请求是完整 GET：去掉条件头再取完整表示")
+                fwd2 = {k: v for k, v in forwarded.items()
+                        if k not in ("if-none-match", "if-modified-since")}
+                counters["origin_fetches"] += 1
+                st2, hd2, bd2 = self._fetch_origin(origin, fwd2, at, trace)
+                self._count_origin_response(counters, st2, hd2, bd2)
+                full_resp = {"status": st2, "headers": hd2, "body": bd2}
+                if st2 == 200:
+                    return self._full_replaces_for_range(
+                        cache_key, full_resp, entry, url, method, at, req_headers,
+                        req_no_store, trace, counters,
+                        reason="部分片段 + 完整 GET：验证器未变，补齐为完整表示")
+            log("CLIENT_NOT_MODIFIED", "无（完整）缓存条目却收到 304，原样透传")
             return self._done(counters, origin_resp, NOT_MODIFIED, at, url, method,
-                              req_headers, trace, None, origin_used=True,
+                              req_headers, trace, entry, origin_used=True,
                               origin_status=304, origin_resp=origin_resp)
+
+        # ---- 206：分段缓存路径（无缓存条目 / 客户端条件请求 / range_cache 关闭） ----
+        if origin_status == 206 and want_range:
+            return self._handle_origin_206(
+                cache_key, origin_resp, origin, url, method, at, req_headers,
+                req_no_store, trace, counters, entry,
+                client_conditional=client_conditional)
+
+        # ---- 416：范围不可满足（无缓存长度可依，由源站判定） ----
+        if origin_status == 416 and want_range:
+            counters["unsatisfiable"] += 1
+            log("RANGE_416", "源站返回 416：范围不可满足")
+            rinfo = {"requested": req_headers.get("range"), "served_from": "origin-416"}
+            return self._done(counters, origin_resp, UNSATISFIABLE, at, url, method,
+                              req_headers, trace, entry, origin_used=True,
+                              origin_status=416, origin_resp=origin_resp,
+                              range_info=rinfo)
 
         # ---- 完整响应：尝试写缓存 ----
         why_not = None
         stored_entry = None
+        old_partial = None
         if method == "GET" and not req_no_store:
+            # 若同一变体此前只缓存了部分片段，记录完整响应与其验证器的关系
+            cur = self._find_variant(cache_key, req_headers)
+            old_partial = cur if cur is not None and cur.get("partial") else None
+            if old_partial is not None:
+                ok, basis = same_representation(old_partial["headers"], origin_headers)
+                if ok:
+                    log("PARTIAL_SUPERSEDED",
+                        f"完整 200 与片段验证器一致（{basis}），分段缓存被完整表示替代")
+                else:
+                    counters["segments_invalidated"] += 1
+                    log("INVALIDATE_SEGMENTS",
+                        f"完整 200 的验证器已变化（{basis}），丢弃旧片段")
             store_info = self._try_store(cache_key, origin_resp, req_headers, at, trace)
             if store_info["stored"]:
                 stored_entry = store_info["entry"]
@@ -439,9 +846,9 @@ class Engine:
 
         served = origin_resp
         if stored_entry is not None:
-            if entry is not None:
+            if entry is not None or old_partial is not None:
                 verdict = REFRESHED
-                log("REFRESHED", "重验证返回完整新响应，缓存条目已替换")
+                log("REFRESHED", "回源返回完整新响应，缓存条目已替换")
             else:
                 verdict = MISS
                 log("MISS_STORED", "回源完整响应已写入缓存")
@@ -449,14 +856,524 @@ class Engine:
             verdict = UNCACHEABLE
             log("UNCACHEABLE", why_not)
 
-        # 结果中附带执行后仍存在的缓存条目摘要
         after_entry = stored_entry
         if after_entry is None and entry is not None and self._variant_exists(cache_key, entry):
             after_entry = entry
+        range_info = None
+        if "range" in req_headers:
+            # 源站忽略了 Range（不支持/If-Range 不符），返回完整 200
+            range_info = {"requested": req_headers["range"],
+                          "served_full_fallback": True,
+                          "reason": ("If-Range 不匹配" if strip_range else "源站未按 Range 返回 206"),
+                          "segments_after": self._segments_view(after_entry)}
         return self._done(counters, served, verdict, at, url, method,
                           req_headers, trace, after_entry,
                           origin_used=True, origin_status=origin_status,
-                          origin_resp=origin_resp)
+                          origin_resp=origin_resp, range_info=range_info)
+
+    # ---- 字节范围：回源补齐 / 重验证 -------------------------------------
+
+    def _range_origin_path(self, plan, origin, url, method, at, req_headers,
+                           req_cc, req_no_store, if_range, trace, counters, cache_key):
+        kind_p = plan[0]
+        if origin is None:
+            self._trace(trace, "ORIGIN_MISSING", f"源站未定义资源 {url}，仿真返回 502")
+            served = self._gateway_error(502, "Bad Gateway (origin resource not defined in scenario)")
+            return self._done(counters, served, ERROR, at, url, method,
+                              req_headers, trace, plan[1], origin_used=True,
+                              origin_status=502, origin_resp=served)
+
+        if kind_p == "validate-covered":
+            _, entry, interval, rinfo_base, age0 = plan
+            # 区间完整覆盖但缓存陈旧：发条件请求（不带 Range）
+            fwd = dict(req_headers)
+            fwd.pop("range", None)
+            if entry["headers"].get("etag"):
+                fwd["if-none-match"] = entry["headers"]["etag"]
+            elif entry["headers"].get("last-modified"):
+                fwd["if-modified-since"] = entry["headers"]["last-modified"]
+            self._trace(trace, "REVALIDATE",
+                f"区间已覆盖但缓存陈旧，条件重验证 { {k: v for k, v in fwd.items() if k.startswith('if-') and k != 'if-range'} }")
+            counters["origin_fetches"] += 1
+            counters["revalidations"] += 1
+            st, hd, bd = self._fetch_origin(origin, fwd, at, trace)
+            self._count_origin_response(counters, st, hd, bd)
+            if st == 304:
+                counters["not_modified"] += 1
+                self._merge_304(entry, hd, at, trace)
+                age = self._entry_age(entry, at)
+                served, rinfo = self._serve_cached_range(entry, None, age, at,
+                                                         interval=interval)
+                rinfo = {**rinfo_base, **rinfo, "served_from": "cache-after-304"}
+                self._trace(trace, "RANGE_REVALIDATED", "源站 304：片段仍有效，用缓存片段拼出 206")
+                return self._done(counters, served, REVALIDATED, at, url, method,
+                                  req_headers, trace, entry, origin_used=True,
+                                  origin_status=304,
+                                  origin_resp={"status": 304, "headers": hd, "body": bd},
+                                  range_info=rinfo)
+            if st == 200:
+                return self._full_replaces_for_range(
+                    cache_key, {"status": 200, "headers": hd, "body": bd},
+                    entry, url, method, at, req_headers, req_no_store, trace,
+                    counters, reason="陈旧重验证返回完整 200（验证器变化）")
+            served = self._gateway_error(502, f"Unexpected origin status {st} for range revalidation")
+            return self._done(counters, served, ERROR, at, url, method,
+                              req_headers, trace, entry, origin_used=True)
+
+        # kind == "gaps"
+        _, entry, interval, gaps, rinfo_base, need_validate, age0, full_get = plan
+        # 分段缓存开关关闭：直接转发客户端 Range，206 不落缓存
+        if not self.config["range_cache"]:
+            self._trace(trace, "RANGE_CACHE_DISABLED",
+                "配置 range_cache=false：不补齐/合片段，Range 直接透传源站")
+            fwd = dict(req_headers)
+            counters["origin_fetches"] += 1
+            st, hd, bd = self._fetch_origin(origin, fwd, at, trace)
+            self._count_origin_response(counters, st, hd, bd, range_hdr=fwd.get("range"))
+            served = {"status": st, "headers": hd, "body": bd}
+            rinfo = {**rinfo_base, "served_from": "origin",
+                     "stored": False, "segments_after": self._segments_view(entry)}
+            verdict = RANGE_FILL if st == 206 else (UNSATISFIABLE if st == 416 else REFRESHED)
+            if st == 416:
+                counters["unsatisfiable"] += 1
+            return self._done(counters, served, verdict, at, url, method,
+                              req_headers, trace, entry, origin_used=True,
+                              origin_status=st, origin_resp=served, range_info=rinfo)
+
+        validator_header = None
+        if need_validate:
+            et = entry["headers"].get("etag")
+            if _is_strong_etag(et):
+                validator_header = ("if-range", et)
+            elif entry["headers"].get("last-modified"):
+                validator_header = ("if-range", entry["headers"]["last-modified"])
+
+        # 逐段回源补齐（每个缺口是一个单区间请求）
+        fetched = []
+        for gi, (gs, ge) in enumerate(gaps):
+            fwd = {k: v for k, v in req_headers.items()
+                   if k not in ("range", "if-range", "if-none-match", "if-modified-since")}
+            fwd["range"] = f"bytes={gs}-{ge}"
+            if validator_header is not None:
+                fwd["if-range"] = validator_header[1]
+            counters["origin_fetches"] += 1
+            counters["range_fetches"] += 1
+            self._trace(trace, "RANGE_FETCH",
+                f"缺口 [{gs},{ge}]（{ge - gs + 1} 字节）回源"
+                + (f"，附带 {validator_header[0]}: {validator_header[1]}"
+                   if validator_header else ""))
+            st, hd, bd = self._fetch_origin(origin, fwd, at, trace)
+            self._count_origin_response(counters, st, hd, bd, range_hdr=fwd["range"])
+
+            if st == 200:
+                # If-Range 不匹配：源站忽略 Range，返回完整表示。丢弃旧片段
+                return self._full_replaces_for_range(
+                    cache_key, {"status": 200, "headers": hd, "body": bd},
+                    entry, url, method, at, req_headers, req_no_store, trace,
+                    counters, reason="回源补缺口时验证器已变化（If-Range 不匹配）")
+            if st == 416:
+                counters["unsatisfiable"] += 1
+                served = {"status": 416, "headers": hd, "body": bd}
+                self._trace(trace, "RANGE_416", "补齐缺口时源站返回 416")
+                return self._done(counters, served, UNSATISFIABLE, at, url, method,
+                                  req_headers, trace, entry, origin_used=True,
+                                  origin_status=416, origin_resp=served,
+                                  range_info={**rinfo_base, "served_from": "origin-416"})
+            if st != 206:
+                served = self._gateway_error(502, f"Unexpected origin status {st} during range fill")
+                return self._done(counters, served, ERROR, at, url, method,
+                                  req_headers, trace, entry, origin_used=True)
+            cr = parse_content_range(hd.get("content-range", ""))
+            if cr is None:
+                served = self._gateway_error(502, "206 缺少合法 Content-Range")
+                return self._done(counters, served, ERROR, at, url, method,
+                                  req_headers, trace, entry, origin_used=True)
+            fetched.append((cr[0], cr[1], cr[2], bd, hd))
+
+        # 合并片段（强验证器一致性已由 If-Range 路径保证，这里再确认一次）
+        for fs, fe, flen, fb, fh in fetched:
+            store_info = self._store_partial(
+                cache_key,
+                {"status": 206, "headers": fh,
+                 "body": fb if len(fb) == fe - fs + 1 else fb[:fe - fs + 1]},
+                (fs, fe, flen), req_headers, at, trace, expected_entry=entry)
+            if not store_info["stored"]:
+                # 合并被拒绝（验证器不一致）：安全回退完整回源
+                self._trace(trace, "RANGE_MERGE_REJECTED",
+                    f"片段 [{fs},{fe}] 无法合并：{store_info['reason']}，回退完整回源")
+                fwd = {k: v for k, v in req_headers.items()
+                       if k not in ("range", "if-range")}
+                counters["origin_fetches"] += 1
+                st, hd, bd = self._fetch_origin(origin, fwd, at, trace)
+                self._count_origin_response(counters, st, hd, bd)
+                return self._full_replaces_for_range(
+                    cache_key, {"status": st, "headers": hd, "body": bd},
+                    entry, url, method, at, req_headers, req_no_store, trace,
+                    counters, reason=store_info["reason"])
+            entry = store_info["entry"]
+
+        counters["range_fills"] += 1
+        age = self._entry_age(entry, at)
+        covered, gaps_after = self._coverage(entry, *interval)
+        fetched_ranges = [[fs, fe] for fs, fe, *_ in fetched]
+        fetched_bytes = sum(fe - fs + 1 for fs, fe, *_ in fetched)
+        segments_after = self._segments_view(entry)
+
+        if full_get:
+            # 完整 GET 命中部分片段：缺口补齐后应已拼满完整表示，返回 200
+            served = self._entry_response(entry, age, at)
+            rinfo = {**rinfo_base, "covered": covered, "gaps": gaps_after,
+                     "fetched": fetched_ranges, "full_get": True,
+                     "served_from": "cache+origin-fill",
+                     "segments_after": segments_after}
+            self._trace(trace, "RANGE_FILLED",
+                f"完整 GET 缺口补齐完成，本次回源 {fetched_bytes} 字节，"
+                f"合并后片段={segments_after}，返回完整 200")
+            return self._done(counters, served, RANGE_FILL, at, url, method,
+                              req_headers, trace, entry, origin_used=True,
+                              origin_status=200, range_info=rinfo)
+
+        served, rinfo = self._serve_cached_range(entry, None, age, at, interval=interval)
+        rinfo = {**rinfo_base,
+                 "covered": covered, "gaps": gaps_after,
+                 "fetched": fetched_ranges,
+                 "served_from": "cache+origin-fill",
+                 "segments_after": segments_after,
+                 **rinfo}
+        self._trace(trace, "RANGE_FILLED",
+            f"缺口补齐完成，本次回源 {fetched_bytes} 字节，"
+            f"合并后片段={segments_after}")
+        return self._done(counters, served, RANGE_FILL, at, url, method,
+                          req_headers, trace, entry, origin_used=True,
+                          range_info=rinfo)
+
+    def _full_replaces_for_range(self, cache_key, resp, entry, url, method, at,
+                                 req_headers, req_no_store, trace, counters,
+                                 reason):
+        """区间请求路径上收到完整 200：按验证器关系丢弃旧片段，存完整表示，返回 200。"""
+        old = self._find_variant(cache_key, req_headers) or entry
+        if old is not None and old.get("partial"):
+            ok, basis = same_representation(old["headers"], resp["headers"])
+            if ok:
+                self._trace(trace, "PARTIAL_SUPERSEDED", f"{reason}；验证器仍一致（{basis}），以完整表示替代片段")
+            else:
+                counters["segments_invalidated"] += 1
+                self._trace(trace, "INVALIDATE_SEGMENTS",
+                    f"{reason}；验证器变化（{basis}），旧片段全部丢弃")
+        stored_entry = None
+        why = None
+        if method == "GET" and not req_no_store:
+            info = self._try_store(cache_key, resp, req_headers, at, trace)
+            if info["stored"]:
+                stored_entry = info["entry"]
+            else:
+                why = info["reason"]
+                if entry is not None:
+                    self._invalidate_variant(cache_key, entry)
+        served = resp
+        if stored_entry is not None:
+            verdict = REFRESHED
+            self._trace(trace, "REFRESHED", "完整 200 已写入缓存（客户端得到完整表示，而非 206）")
+        else:
+            verdict = UNCACHEABLE
+            self._trace(trace, "UNCACHEABLE", why or "完整响应不可缓存")
+        rinfo = {"requested": req_headers.get("range"),
+                 "served_full_fallback": True, "reason": reason,
+                 "segments_after": self._segments_view(stored_entry)}
+        return self._done(counters, served, verdict, at, url, method,
+                          req_headers, trace, stored_entry or entry,
+                          origin_used=True, origin_status=200,
+                          origin_resp=resp, range_info=rinfo)
+
+    def _handle_origin_206(self, cache_key, origin_resp, origin, url, method, at,
+                           req_headers, req_no_store, trace, counters, entry,
+                           client_conditional):
+        """直接透传路径上源站返回的 206（无缓存条目 / 客户端条件 / 首次区间请求）。"""
+        cr = parse_content_range(origin_resp["headers"].get("content-range", ""))
+        stored_entry = None
+        rinfo = {"requested": req_headers.get("range"), "served_from": "origin"}
+        if cr is None:
+            self._trace(trace, "RANGE_206_NO_CR", "206 缺少合法 Content-Range，不缓存")
+        elif method != "GET" or req_no_store or not self.config["range_cache"]:
+            if not self.config["range_cache"]:
+                self._trace(trace, "RANGE_CACHE_DISABLED", "配置 range_cache=false：206 不写入分段缓存")
+        else:
+            info = self._store_partial(cache_key, origin_resp, cr,
+                                       req_headers, at, trace)
+            if info["stored"]:
+                stored_entry = info["entry"]
+                counters["range_fills"] += 1
+                rinfo["stored"] = True
+                rinfo["segments_after"] = self._segments_view(stored_entry)
+            else:
+                self._trace(trace, "RANGE_UNCACHEABLE", f"206 未缓存：{info['reason']}")
+                rinfo["stored"] = False
+                rinfo["reason"] = info["reason"]
+        served = origin_resp
+        verdict = RANGE_FILL
+        self._trace(trace, "RANGE_SERVED_206", "源站返回 206 部分内容")
+        return self._done(counters, served, verdict, at, url, method,
+                          req_headers, trace, stored_entry, origin_used=True,
+                          origin_status=206, origin_resp=origin_resp,
+                          range_info=rinfo)
+
+    # ---- 片段数据结构 / 合并 / 覆盖 --------------------------------------
+
+    @staticmethod
+    def _segments_view(entry):
+        if entry is None:
+            return []
+        if not entry.get("partial"):
+            return [[0, entry.get("length", body_len(entry.get("body"))) - 1]] \
+                if entry.get("length") else []
+        return [[s["start"], s["end"]] for s in entry.get("segments", [])]
+
+    @staticmethod
+    def _slice_segments(segments, first, last) -> bytes:
+        buf = bytearray()
+        for seg in sorted(segments, key=lambda s: s["start"]):
+            if seg["end"] < first or seg["start"] > last:
+                continue
+            a = max(first, seg["start"])
+            b = min(last, seg["end"])
+            buf += seg["body"][a - seg["start"]:b - seg["start"] + 1]
+        return bytes(buf)
+
+    def _coverage(self, entry, first, last):
+        """返回请求区间内已覆盖的子区间列表与缺口列表（均为闭区间）。"""
+        if not entry.get("partial"):
+            if entry.get("length", 0) >= last + 1:
+                return [[first, last]], []
+            return [], [[first, last]]
+        covered, gaps = [], []
+        cursor = first
+        for seg in sorted(entry.get("segments", []), key=lambda s: s["start"]):
+            s, e = max(seg["start"], first), min(seg["end"], last)
+            if s > e:
+                continue
+            if s > cursor:
+                gaps.append([cursor, s - 1])
+            covered.append([s, e])
+            cursor = max(cursor, e + 1)
+        if cursor <= last:
+            gaps.append([cursor, last])
+        return covered, gaps
+
+    def _merge_segments(self, existing, new_start, new_end, new_body, length,
+                        headers, at, trace):
+        """合并相邻/重叠片段。返回 (segments, complete, merged_count)。
+
+        合并前提：新片段与缓存条目指向同一表示（调用方需先用强 ETag/Last-Modified
+        确认），本函数只做区间代数。
+        """
+        segs = list(existing) + [{
+            "start": new_start, "end": new_end, "body": bytes(new_body)}]
+        segs.sort(key=lambda s: (s["start"], s["end"]))
+        merged = []
+        merges = 0
+        for seg in segs:
+            if merged and seg["start"] <= merged[-1]["end"] + 1:
+                last_seg = merged[-1]
+                if seg["start"] <= last_seg["end"] + 1 and seg["end"] <= last_seg["end"]:
+                    # 完全落在已有片段内（重叠）
+                    overlap = seg["start"] <= last_seg["end"]
+                    if overlap:
+                        merges += 1
+                    continue
+                overlap = seg["start"] <= last_seg["end"]
+                offset = max(0, last_seg["end"] + 1 - seg["start"])
+                last_seg["body"] += seg["body"][offset:]
+                last_seg["end"] = seg["end"]
+                merges += 1
+                log_kind = "重叠" if overlap else "相邻"
+                trace.append({"step": len(trace) + 1, "code": "MERGE_SEGMENTS",
+                              "detail": f"{log_kind}片段合并：[{seg['start']},{seg['end']}] "
+                                        f"并入 [{last_seg['start']},{last_seg['end']}]"})
+            else:
+                merged.append(dict(seg))
+        complete = bool(merged) and merged[0]["start"] == 0 and \
+            merged[-1]["end"] == length - 1 and len(merged) == 1
+        return merged, complete, merges
+
+    # ---- 206 存储 --------------------------------------------------------
+
+    def _store_partial(self, cache_key, resp, cr, req_headers, at, trace,
+                       expected_entry=None):
+        """保存 206 部分响应；与同变体片段做验证器确认后合并。"""
+        status, headers = resp["status"], resp["headers"]
+        cc = parse_cc(headers.get("cache-control", ""))
+
+        # 与 _try_store 相同的可缓存性门槛
+        if "no-store" in cc:
+            return {"stored": False, "reason": "响应 Cache-Control: no-store，禁止缓存"}
+        if self.config["cache_mode"] == "shared" and "private" in cc:
+            return {"stored": False, "reason": "共享缓存模式下响应 private，不允许缓存"}
+        if headers.get("vary", "").strip() == "*":
+            return {"stored": False, "reason": "Vary: * 表示不受限变体，不缓存"}
+        if status not in self.config["cacheable_statuses"]:
+            return {"stored": False,
+                    "reason": f"状态码 {status} 不在可缓存列表 {self.config['cacheable_statuses']}"}
+
+        # 片段合并必须能确认表示身份：强 ETag 或 Last-Modified
+        strong = _is_strong_etag(headers.get("etag"))
+        if not strong and not headers.get("last-modified"):
+            return {"stored": False,
+                    "reason": "206 分段缓存需要强 ETag 或 Last-Modified 验证器"}
+
+        fs, fe, flen = cr
+        body = resp["body"]
+        if flen <= 0 or not (0 <= fs <= fe < flen):
+            return {"stored": False, "reason": f"Content-Range 非法: {headers.get('content-range')}"}
+        if body_len(body) < fe - fs + 1:
+            return {"stored": False, "reason": "206 响应体短于 Content-Range 声明的区间"}
+        body = bytes(body)[:fe - fs + 1]
+
+        vary_raw = headers.get("vary")
+        vary_headers = ([h.strip().lower() for h in vary_raw.split(",") if h.strip()]
+                        if vary_raw else [])
+        selected = {h: req_headers.get(h, "") for h in vary_headers}
+        vkey = _variant_key(selected)
+
+        bucket = self.state["cache"].setdefault(
+            cache_key, {"vary": vary_headers, "variants": []})
+        bucket["vary"] = vary_headers or bucket.get("vary", [])
+        existing = next((v for v in bucket["variants"] if v["variant_key"] == vkey), None)
+
+        # 已有完整表示：验证器一致则无需降级为片段
+        if existing is not None and not existing.get("partial"):
+            ok, basis = same_representation(existing["headers"], headers)
+            if ok:
+                return {"stored": False, "reason": f"已有完整表示且验证器一致（{basis}）",
+                        "entry": existing}
+            # 表示变了：旧完整条目失效，用新片段替换
+            self.state["counters"]["segments_invalidated"] += 1
+            trace.append({"step": len(trace) + 1, "code": "INVALIDATE_SEGMENTS",
+                          "detail": f"新片段验证器变化（{basis}），丢弃旧完整条目"})
+            bucket["variants"] = [v for v in bucket["variants"] if v["variant_key"] != vkey]
+            existing = None
+
+        if existing is not None:
+            ok, basis = same_representation(existing["headers"], headers)
+            if not ok:
+                self.state["counters"]["segments_invalidated"] += 1
+                trace.append({"step": len(trace) + 1, "code": "INVALIDATE_SEGMENTS",
+                              "detail": f"验证器变化（{basis}），丢弃旧片段 "
+                                        f"{self._segments_view(existing)}"})
+                bucket["variants"] = [v for v in bucket["variants"]
+                                      if v["variant_key"] != vkey]
+                existing = None
+
+        ttl = self._compute_ttl(headers, cc, at)
+        age_raw = str(headers.get("age", ""))
+        if existing is None:
+            entry = {
+                "variant_key": vkey,
+                "status": 206,
+                "headers": copy.deepcopy(headers),
+                "stored_at": at,
+                "init_age": int(age_raw) if age_raw.isdigit() else 0,
+                "ttl": ttl,
+                "no_cache": "no-cache" in cc,
+                "must_revalidate": self._must_revalidate(cc),
+                "rev_by": "proxy" if "proxy-revalidate" in cc else "must",
+                "partial": True,
+                "length": flen,
+                "segments": [{"start": fs, "end": fe, "body": body}],
+                "body": b"",
+            }
+            bucket["variants"].append(entry)
+            trace.append({"step": len(trace) + 1, "code": "RANGE_STORE",
+                          "detail": f"写入分段缓存：[{fs},{fe}]/{flen}（{fe - fs + 1} 字节），"
+                                    f"ttl={'None' if ttl is None else f'{ttl:.0f}s'} 验证器="
+                                    f"{headers.get('etag') or headers.get('last-modified')}"})
+            return {"stored": True, "entry": entry, "reason": None}
+
+        # 与既有片段合并（验证器已确认一致）
+        merged, complete, merges = self._merge_segments(
+            existing["segments"], fs, fe, body, flen, headers, at, trace)
+        self.state["counters"]["segments_merged"] += max(1, merges)
+        existing["segments"] = merged
+        existing["length"] = flen
+        # 206 是部分响应，不构成对完整表示的重验证：新鲜度窗口沿用首个片段的
+        # stored_at/ttl，不因后续补缺口而“续命”；只更新元数据头（ETag/LM 等）
+        merged_headers = dict(existing["headers"])
+        merged_headers.update(headers)
+        existing["headers"] = merged_headers
+        new_cc = parse_cc(merged_headers.get("cache-control", ""))
+        if "no-cache" in new_cc:
+            existing["no_cache"] = True
+        if self._must_revalidate(new_cc):
+            existing["must_revalidate"] = True
+        ttl_txt = "None" if existing["ttl"] is None else f"{existing['ttl']:.0f}s"
+        trace.append({"step": len(trace) + 1, "code": "RANGE_MERGE_FRESHNESS",
+                      "detail": "片段合并沿用原新鲜度窗口（206 不延长寿命），"
+                                f"stored_at={existing['stored_at']:.0f} ttl={ttl_txt}"})
+
+        if complete:
+            full = self._slice_segments(merged, 0, flen - 1)
+            existing["partial"] = False
+            existing["body"] = full
+            existing["status"] = 200
+            existing["segments"] = merged
+            trace.append({"step": len(trace) + 1, "code": "MERGE_COMPLETE",
+                          "detail": f"片段已拼满 [0,{flen - 1}]，升级为完整表示（{flen} 字节）"})
+        return {"stored": True, "entry": existing, "reason": None}
+
+    def _find_variant(self, cache_key, req_headers):
+        bucket = self.state["cache"].get(cache_key)
+        return self._select_variant(bucket, req_headers, []) if bucket else None
+
+    # ---- 206 / 416 响应组装 ----------------------------------------------
+
+    def _serve_cached_range(self, entry, range_spec, age, at, stale=False,
+                            interval=None):
+        """用缓存条目（完整或片段）拼出 206；缺片段返回 (None, info)。"""
+        if interval is None:
+            interval = resolve_range(range_spec, entry["length"])
+        first, last = interval
+        covered, gaps = self._coverage(entry, first, last)
+        if gaps:
+            return None, {"first": first, "last": last, "covered": covered, "gaps": gaps}
+        if entry.get("partial"):
+            data = self._slice_segments(entry["segments"], first, last)
+        else:
+            data = entry["body"][first:last + 1]
+        headers = copy.deepcopy(entry["headers"])
+        headers["content-range"] = f"bytes {first}-{last}/{entry['length']}"
+        headers["accept-ranges"] = "bytes"
+        headers["content-length"] = str(last - first + 1)
+        headers["age"] = str(int(max(0, age)))
+        if stale:
+            headers["warning"] = '110 cache-sim "Response is stale (network disconnected)"'
+        served = {"status": 206, "headers": headers, "body": data}
+        info = {"first": first, "last": last, "length": entry["length"],
+                "covered": covered, "gaps": [], "served_bytes": last - first + 1,
+                "segments_after": self._segments_view(entry)}
+        return served, info
+
+    def _range_416(self, length):
+        return {"status": 416,
+                "headers": {"content-range": f"bytes */{length}",
+                            "accept-ranges": "bytes",
+                            "content-type": "text/plain; charset=utf-8"},
+                "body": b"Requested Range Not Satisfiable"}
+
+    # ---- If-Range --------------------------------------------------------
+
+    def _if_range_matches(self, value, headers):
+        """客户端 If-Range 是否与缓存验证器一致。True/False/None（无法判断）。"""
+        v = str(value).strip()
+        if '"' in v:
+            et = headers.get("etag")
+            # RFC 7233：弱 ETag 不能用于 If-Range
+            if not _is_strong_etag(v) or not _is_strong_etag(et):
+                return False
+            return _etag_strong_equal(v, et)
+        # 当作 HTTP 日期
+        t1, t2 = parse_time_value(v), parse_time_value(headers.get("last-modified"))
+        if t1 is None or t2 is None:
+            return None
+        return t1 == t2
 
     # ---- 变体选择 / 新鲜度 ------------------------------------------------
 
@@ -542,6 +1459,12 @@ class Engine:
         headers = copy.deepcopy(origin["headers"])
         status = origin["status"]
         body = origin["body"]
+        length = len(body)
+        # 回源响应带上源站的 Accept-Ranges 能力
+        headers["accept-ranges"] = origin.get("accept_ranges",
+                                              headers.get("accept-ranges", "bytes"))
+        if "content-length" not in headers:
+            headers["content-length"] = str(length)
 
         inm = fwd_headers.get("if-none-match")
         ims = fwd_headers.get("if-modified-since")
@@ -564,10 +1487,71 @@ class Engine:
         if unchanged and status == 200:
             # 304 只携带校验器/缓存相关头
             keep = {h: headers[h] for h in
-                    ("etag", "last-modified", "cache-control", "expires", "vary", "date")
+                    ("etag", "last-modified", "cache-control", "expires", "vary", "date",
+                     "accept-ranges")
                     if h in headers}
-            return 304, keep, ""
+            return 304, keep, b""
+
+        # Range 处理（条件请求 304 优先于 Range）
+        rng = fwd_headers.get("range")
+        if rng is not None:
+            spec = parse_range_spec(rng)
+            if spec[0] == "range":
+                if origin.get("accept_ranges", "bytes") != "bytes":
+                    self._trace(trace, "RANGE_UNSUPPORTED",
+                                f"源站 Accept-Ranges: none，忽略 Range {rng}，返回完整 200")
+                    return status, headers, body
+
+                # If-Range 判定
+                ir = fwd_headers.get("if-range")
+                if ir is not None:
+                    match = self._origin_if_range_match(ir, etag, lm)
+                    self._trace(trace, "ORIGIN_IF_RANGE",
+                        f"If-Range {ir} vs 当前（ETag={etag}, Last-Modified={lm}）-> "
+                        f"{'一致，按 Range 返回 206' if match else '不一致，忽略 Range 返回完整 200'}")
+                    if not match:
+                        return status, headers, body
+
+                interval = resolve_range(spec, length)
+                if interval is None:
+                    h = {"content-range": f"bytes */{length}",
+                         "accept-ranges": "bytes",
+                         "content-type": "text/plain; charset=utf-8"}
+                    self._trace(trace, "ORIGIN_416",
+                                f"Range {rng} 超出表示长度 {length}，返回 416")
+                    return 416, h, b"Requested Range Not Satisfiable"
+                first, last = interval
+                h = dict(headers)
+                h["content-range"] = f"bytes {first}-{last}/{length}"
+                h["content-length"] = str(last - first + 1)
+                self._trace(trace, "ORIGIN_206",
+                            f"源站按 Range 返回 206：[{first},{last}]/{length}，"
+                            f"{last - first + 1} 字节")
+                return 206, h, body[first:last + 1]
+            if spec[0] == "multi":
+                self._trace(trace, "RANGE_MULTI_UNSUPPORTED",
+                            "源站仿真不支持多区间，返回完整 200")
+            else:
+                self._trace(trace, "RANGE_PARSE_IGNORE",
+                            f"非法 Range {rng}，源站忽略并返回完整 200")
         return status, headers, body
+
+    @staticmethod
+    def _origin_if_range_match(value, etag, lm):
+        v = str(value).strip()
+        if '"' in v:
+            # RFC 7233：If-Range 中的弱 ETag 无效 -> 视为不匹配
+            return _is_strong_etag(v) and _is_strong_etag(etag) and \
+                v.strip() == etag.strip()
+        t1, t2 = parse_time_value(v), parse_time_value(lm)
+        return t1 is not None and t2 is not None and t1 == t2
+
+    def _count_origin_response(self, counters, status, headers, body, range_hdr=None):
+        counters["bytes_from_origin"] += wire_size(status, headers, body)
+        if status == 206:
+            counters["range_bytes_from_origin"] += body_len(body)
+            if range_hdr is None:
+                counters["range_fetches"] += 1
 
     # ---- 304 合并 / 写缓存 -----------------------------------------------
 
@@ -582,7 +1566,7 @@ class Engine:
         entry["no_cache"] = "no-cache" in cc
         entry["must_revalidate"] = self._must_revalidate(cc)
         entry["rev_by"] = "proxy" if "proxy-revalidate" in cc else "must"
-        self._trace(trace, "MERGE_304", "304 响应头已合并进缓存条目，age 归零")
+        self._trace(trace, "MERGE_304", "304 响应头已合并进缓存条目，age 归零（片段保留）")
 
     def _must_revalidate(self, cc) -> bool:
         if "must-revalidate" in cc:
@@ -612,32 +1596,36 @@ class Engine:
                 return max(0.0, ttl)
         return None
 
-    def _try_store(self, cache_key, resp, req_headers, at, trace):
-        status, headers = resp["status"], resp["headers"]
+    def _check_store_rules(self, status, headers, req_headers, at, trace):
+        """完整/部分响应共用的可缓存性检查，返回 (ok, cc, work_headers, reason)。"""
         cc = parse_cc(headers.get("cache-control", ""))
-
-        # 无 Cache-Control 时注入仿真缺省指令（供 A/B 对比）
+        work_headers = headers
         if "cache-control" not in headers and self.config["default_cc"]:
             cc = {str(k).lower(): (int(v) if isinstance(v, (int, float)) else v)
                   for k, v in self.config["default_cc"].items()}
-            headers = dict(headers)
-            headers["cache-control"] = ", ".join(
-                str(k) if v is True else f"{k}={v}" for k, v in cc.items()
-            )
-            resp["headers"] = headers
+            work_headers = dict(headers)
+            work_headers["cache-control"] = ", ".join(
+                str(k) if v is True else f"{k}={v}" for k, v in cc.items())
             trace.append({"step": len(trace) + 1, "code": "DEFAULT_CC",
                           "detail": f"响应无 Cache-Control，注入仿真缺省指令 {dict(cc)}"})
-
         if status not in self.config["cacheable_statuses"]:
-            return {"stored": False,
-                    "reason": f"状态码 {status} 不在可缓存列表 {self.config['cacheable_statuses']}"}
+            return False, cc, work_headers, \
+                f"状态码 {status} 不在可缓存列表 {self.config['cacheable_statuses']}"
         if "no-store" in cc:
-            return {"stored": False, "reason": "响应 Cache-Control: no-store，禁止缓存"}
+            return False, cc, work_headers, "响应 Cache-Control: no-store，禁止缓存"
         if self.config["cache_mode"] == "shared" and "private" in cc:
-            return {"stored": False, "reason": "共享缓存模式下响应 private，不允许缓存"}
-        vary_raw = headers.get("vary")
-        if vary_raw and vary_raw.strip() == "*":
-            return {"stored": False, "reason": "Vary: * 表示不受限变体，不缓存"}
+            return False, cc, work_headers, "共享缓存模式下响应 private，不允许缓存"
+        if work_headers.get("vary", "").strip() == "*":
+            return False, cc, work_headers, "Vary: * 表示不受限变体，不缓存"
+        return True, cc, work_headers, None
+
+    def _try_store(self, cache_key, resp, req_headers, at, trace):
+        status, headers0 = resp["status"], resp["headers"]
+        ok, cc, headers, why = self._check_store_rules(
+            status, headers0, req_headers, at, trace)
+        if not ok:
+            return {"stored": False, "reason": why}
+        resp["headers"] = headers
 
         ttl = self._compute_ttl(headers, cc, at)
         has_validator = "etag" in headers or "last-modified" in headers
@@ -650,21 +1638,26 @@ class Engine:
             if ttl is None:
                 ttl = 0.0  # 存但立即陈旧，下次使用需重验证
 
+        vary_raw = headers.get("vary")
         vary_headers = ([h.strip().lower() for h in vary_raw.split(",") if h.strip()]
                         if vary_raw else [])
         selected = {h: req_headers.get(h, "") for h in vary_headers}
         age_raw = str(headers.get("age", ""))
+        body = resp["body"]
         entry = {
             "variant_key": _variant_key(selected),
             "status": status,
             "headers": copy.deepcopy(headers),
-            "body": resp["body"],
+            "body": bytes(body),
             "stored_at": at,
             "init_age": int(age_raw) if age_raw.isdigit() else 0,
             "ttl": ttl,
             "no_cache": "no-cache" in cc,
             "must_revalidate": self._must_revalidate(cc),
             "rev_by": "proxy" if "proxy-revalidate" in cc else "must",
+            "partial": False,
+            "length": body_len(body),
+            "segments": [],
         }
         bucket = self.state["cache"].setdefault(
             cache_key, {"vary": vary_headers, "variants": []})
@@ -674,7 +1667,8 @@ class Engine:
         bucket["variants"].append(entry)
         trace.append({"step": len(trace) + 1, "code": "STORE",
                       "detail": f"写入缓存：ttl={entry['ttl']}s vary={vary_headers or '无'} "
-                                f"no_cache={entry['no_cache']} must_revalidate={entry['must_revalidate']}"})
+                                f"no_cache={entry['no_cache']} must_revalidate={entry['must_revalidate']} "
+                                f"length={entry['length']}"})
         return {"stored": True, "reason": None, "entry": entry}
 
     def _invalidate_variant(self, cache_key, entry):
@@ -706,19 +1700,25 @@ class Engine:
     def _gateway_error(status, message):
         return {"status": status,
                 "headers": {"content-type": "text/plain; charset=utf-8"},
-                "body": message}
+                "body": message.encode("utf-8") if isinstance(message, str) else message}
 
     def _done(self, counters, served, verdict, at, url, method, req_headers,
-              trace, entry, origin_used, origin_status=None, origin_resp=None):
+              trace, entry, origin_used, origin_status=None, origin_resp=None,
+              range_info=None):
+        served_body = served.get("body", b"")
         counters["bytes_served"] += wire_size(
-            served["status"], served["headers"], served.get("body"))
-        if verdict in (HIT, REVALIDATED, STALE):
+            served["status"], served["headers"], served_body)
+        if verdict in (HIT, RANGE_HIT, REVALIDATED, STALE):
             counters["hits"] += 1
         if verdict == STALE:
             counters["stale_served"] += 1
         if verdict == ERROR:
             counters["errors"] += 1
-        return {
+        if verdict == RANGE_HIT:
+            counters["range_hits"] += 1
+        text = served_body.decode("utf-8", "replace") if isinstance(served_body, bytes) \
+            else str(served_body)
+        out = {
             "type": "request",
             "at": at,
             "url": url,
@@ -729,23 +1729,30 @@ class Engine:
             "from_origin": origin_used,
             "origin_status": origin_status,
             "response_headers": served["headers"],
-            "response_body": served.get("body", ""),
+            # 文本预览（UTF-8 替换）；二进制内容请用 response_body_b64
+            "response_body": text,
+            "response_body_b64": to_b64(served_body)
+            if isinstance(served_body, bytes) else to_b64(str(served_body).encode("utf-8")),
             "bytes_served": wire_size(
-                served["status"], served["headers"], served.get("body")),
+                served["status"], served["headers"], served_body),
             "origin_bytes": (wire_size(origin_resp["status"], origin_resp["headers"],
                                        origin_resp.get("body"))
                              if origin_resp is not None else 0),
-            "cache_entry_after": self._entry_summary(entry) if entry else None,
+            "cache_entry_after": self._entry_summary(entry),
             "network_up": self.state["network_up"],
             "trace": trace,
             "counters": copy.deepcopy(counters),
         }
+        if range_info is not None:
+            out["range"] = range_info
+        return out
 
     @staticmethod
     def _entry_summary(entry):
         if entry is None:
             return None
-        return {
+        partial = entry.get("partial", False)
+        out = {
             "status": entry["status"],
             "ttl": entry["ttl"],
             "no_cache": entry["no_cache"],
@@ -754,4 +1761,9 @@ class Engine:
             "etag": entry["headers"].get("etag"),
             "last_modified": entry["headers"].get("last-modified"),
             "vary": entry["headers"].get("vary"),
+            "partial": partial,
+            "length": entry.get("length"),
+            "segments": Engine._segments_view(entry),
         }
+        return out
+
