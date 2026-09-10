@@ -10,7 +10,9 @@ import unittest
 
 from cache_sim.engine import (Engine, DEFAULT_CONFIG, new_state,
                               HIT, MISS, REVALIDATED, REFRESHED,
-                              NOT_MODIFIED, UNCACHEABLE, STALE, ERROR)
+                              NOT_MODIFIED, UNCACHEABLE, STALE, ERROR,
+                              RANGE_HIT, RANGE_FILL, UNSATISFIABLE,
+                              parse_range_spec, resolve_range, from_b64)
 from cache_sim.store import Store
 
 
@@ -398,6 +400,252 @@ class ClearAndControlTests(unittest.TestCase):
         self.assertGreater(c["bytes_from_origin"], 1000)
 
 
+def origin_b64(eid, at, url="/bin", data=b"", **kw):
+    import base64
+    ev = {"id": eid, "type": "origin", "at": at, "url": url,
+          "body_base64": base64.b64encode(data).decode(), **kw}
+    return ev
+
+
+def rreq(eid, at, url="/f", rng=None, if_range=None, extra=None):
+    headers = dict(extra or {})
+    if rng:
+        headers["Range"] = rng
+    if if_range is not None:
+        headers["If-Range"] = if_range
+    return {"id": eid, "type": "request", "at": at, "url": url,
+            "headers": headers}
+
+
+def body_of(result):
+    return from_b64(result["response_body_b64"])
+
+
+class RangeParserTests(unittest.TestCase):
+    def test_parse_single_suffix_open(self):
+        self.assertEqual(parse_range_spec("bytes=0-99")[0], "range")
+        self.assertEqual(parse_range_spec("bytes=10-")[0], "range")
+        self.assertEqual(parse_range_spec("bytes=-50")[2], None)
+        self.assertEqual(parse_range_spec("bytes=-50")[3], 50)
+
+    def test_parse_multi_and_invalid(self):
+        self.assertEqual(parse_range_spec("bytes=0-1,2-3")[0], "multi")
+        self.assertEqual(parse_range_spec("bytes=5-1")[0], "invalid")
+        self.assertEqual(parse_range_spec("bytes=abc")[0], "invalid")
+
+    def test_resolve_clamped_and_unsatisfiable(self):
+        self.assertEqual(resolve_range(parse_range_spec("bytes=5-100"), 10),
+                         (5, 9))
+        self.assertIsNone(resolve_range(parse_range_spec("bytes=20-30"), 10))
+        self.assertEqual(resolve_range(parse_range_spec("bytes=-4"), 10), (6, 9))
+        self.assertIsNone(resolve_range(parse_range_spec("bytes=0-0"), 0))
+
+
+class RangeCacheReviewFixesTests(unittest.TestCase):
+    """复核确认的四个范围缓存正确性缺陷的回归测试。"""
+
+    def test_fix1_out_of_range_with_mismatched_if_range_returns_full_200(self):
+        # 新鲜完整缓存；越界 Range + 不匹配的 If-Range：必须忽略 Range 返回完整 200，
+        # 不能先用缓存长度判定 416
+        ev = [
+            origin("o1", 0, url="/f", body="0123456789", etag='"v1"',
+                   headers={"cache-control": "max-age=1000"}),
+            req("r0", 1, "/f"),
+            rreq("r1", 2, rng="bytes=500-600", if_range='"old"'),
+        ]
+        eng, res = run_events({}, ev)
+        self.assertEqual(res[1]["status"], 200)
+        self.assertEqual(res[1]["verdict"], REFRESHED)
+        self.assertEqual(body_of(res[1]), b"0123456789")
+        codes = [t["code"] for t in res[1]["trace"]]
+        self.assertIn("IF_RANGE_MISMATCH", codes)
+        self.assertNotIn("RANGE_416", codes)
+        self.assertTrue(res[1]["range"]["served_full_fallback"])
+        self.assertTrue(res[1]["from_origin"])
+
+    def test_fix1_control_out_of_range_without_if_range_is_416(self):
+        ev = [
+            origin("o1", 0, url="/f", body="0123456789", etag='"v1"',
+                   headers={"cache-control": "max-age=1000"}),
+            req("r0", 1, "/f"),
+            rreq("r1", 2, rng="bytes=500-600"),
+        ]
+        _, res = run_events({}, ev)
+        self.assertEqual(res[1]["status"], 416)
+        self.assertEqual(res[1]["verdict"], UNSATISFIABLE)
+        self.assertFalse(res[1]["from_origin"])
+
+    def test_fix1_out_of_range_with_matching_if_range_is_416(self):
+        # If-Range 匹配：仍按区间处理，越界 -> 416
+        ev = [
+            origin("o1", 0, url="/f", body="0123456789", etag='"v1"',
+                   headers={"cache-control": "max-age=1000"}),
+            req("r0", 1, "/f"),
+            rreq("r1", 2, rng="bytes=500-600", if_range='"v1"'),
+        ]
+        _, res = run_events({}, ev)
+        self.assertEqual(res[1]["status"], 416)
+
+    def test_fix2_first_206_covering_full_representation_promoted(self):
+        # 单个 206 已覆盖完整表示（bytes=0-9/10）：缓存升级为完整条目，
+        # 后续无 Range 的 GET 必须返回完整 200 与全部正文
+        ev = [
+            origin("o1", 0, url="/f", body="0123456789", etag='"v"',
+                   headers={"cache-control": "max-age=1000"}),
+            rreq("r1", 1, rng="bytes=0-9"),
+            {"id": "r2", "type": "request", "at": 2, "url": "/f"},
+        ]
+        eng, res = run_events({}, ev)
+        self.assertEqual(res[0]["status"], 206)
+        self.assertEqual(res[1]["status"], 200)
+        self.assertEqual(res[1]["verdict"], HIT)
+        self.assertEqual(body_of(res[1]), b"0123456789")
+        variant = eng.state["cache"]["GET /f"]["variants"][0]
+        self.assertFalse(variant["partial"])
+        self.assertEqual(variant["body"], b"0123456789")
+        self.assertNotIn("content-range", res[1]["response_headers"])
+
+    def test_fix3_merge_to_full_removes_content_range_and_sets_length(self):
+        # 相邻片段合并成完整表示后：200 响应不得残留 Content-Range，
+        # Content-Length 必须是完整长度而非最后片段长度
+        ev = [
+            origin("o1", 0, url="/f", body="0123456789", etag='"v"',
+                   headers={"cache-control": "max-age=1000"}),
+            rreq("r1", 1, rng="bytes=0-4"),
+            rreq("r2", 2, rng="bytes=5-9"),
+            {"id": "r3", "type": "request", "at": 3, "url": "/f"},
+        ]
+        eng, res = run_events({}, ev)
+        # 合并发生在 r2：r2 的 206 仍带 Content-Range
+        self.assertEqual(res[0]["response_headers"]["content-range"], "bytes 0-4/10")
+        # r3 是拼满后的完整 GET
+        full = res[2]
+        self.assertEqual(full["status"], 200)
+        self.assertNotIn("content-range", full["response_headers"])
+        self.assertEqual(full["response_headers"]["content-length"], "10")
+        self.assertEqual(body_of(full), b"0123456789")
+        variant = eng.state["cache"]["GET /f"]["variants"][0]
+        self.assertFalse(variant["partial"])
+        self.assertEqual(variant["headers"]["content-length"], "10")
+        self.assertNotIn("content-range", variant["headers"])
+
+    def test_fix4_gap_fill_records_actual_origin_bytes(self):
+        ev = [
+            origin("o1", 0, url="/f", body="0123456789ABCDEFGHIJ", etag='"v"',
+                   headers={"cache-control": "max-age=1000"}),
+            rreq("r1", 1, rng="bytes=0-4"),
+            rreq("r2", 2, rng="bytes=10-14"),
+        ]
+        eng, res = run_events({}, ev)
+        fill = res[1]
+        self.assertEqual(fill["verdict"], RANGE_FILL)
+        # 顶层结果与 range 明细都必须记录本次实际回源字节（不再为 0）
+        self.assertGreater(fill["origin_bytes"], 0)
+        self.assertEqual(fill["range"]["origin_bytes"], fill["origin_bytes"])
+        # 已缓存 [0,4]，本次只回源缺口 [10,14] 共 5 字节正文
+        self.assertEqual(fill["range"]["origin_body_bytes"], 5)
+        self.assertEqual(fill["range"]["fetched"], [[10, 14]])
+        # 累计计数器同步
+        self.assertEqual(eng.state["counters"]["range_bytes_from_origin"], 10)
+
+    def test_fix4_range_hit_has_zero_origin_bytes(self):
+        ev = [
+            origin("o1", 0, url="/f", body="0123456789", etag='"v"',
+                   headers={"cache-control": "max-age=1000"}),
+            rreq("r1", 1, rng="bytes=0-4"),
+            rreq("r2", 2, rng="bytes=0-4"),
+        ]
+        _, res = run_events({}, ev)
+        self.assertEqual(res[1]["verdict"], RANGE_HIT)
+        self.assertEqual(res[1]["origin_bytes"], 0)
+        self.assertNotIn("origin_bytes", res[1].get("range", {}))
+
+
+class RangeCacheFlowTests(unittest.TestCase):
+    def test_hit_fill_416_and_gap_accounting(self):
+        data = bytes(range(256))
+        ev = [
+            origin_b64("o", 0, data=data, etag='"v1"',
+                       headers={"cache-control": "max-age=1000"}),
+            rreq("r1", 1, url="/bin", rng="bytes=0-99"),
+            rreq("r2", 2, url="/bin", rng="bytes=0-99"),
+            rreq("r3", 3, url="/bin", rng="bytes=50-149"),
+            rreq("r4", 4, url="/bin", rng="bytes=300-400"),
+        ]
+        eng, res = run_events({}, ev)
+        self.assertEqual([r["verdict"] for r in res],
+                         [RANGE_FILL, RANGE_HIT, RANGE_FILL, UNSATISFIABLE])
+        self.assertEqual(body_of(res[0]), data[0:100])
+        self.assertEqual(body_of(res[2]), data[50:150])
+        c = eng.state["counters"]
+        self.assertEqual(c["range_hits"], 1)
+        # 回源正文 = 100（首次）+ 50（缺口 100-149）
+        self.assertEqual(c["range_bytes_from_origin"], 150)
+
+    def test_if_range_match_allows_fill_mismatch_forces_full(self):
+        ev = [
+            origin("o1", 0, url="/f", body="0123456789", etag='"v1"',
+                   headers={"cache-control": "max-age=1000"}),
+            rreq("r1", 1, rng="bytes=0-3"),
+            rreq("r2", 2, rng="bytes=4-7", if_range='"v1"'),
+            rreq("r3", 3, rng="bytes=8-9", if_range='"old"'),
+        ]
+        _, res = run_events({}, ev)
+        self.assertEqual(res[1]["verdict"], RANGE_FILL)
+        self.assertEqual(res[2]["verdict"], REFRESHED)
+        self.assertEqual(res[2]["status"], 200)
+        self.assertEqual(body_of(res[2]), b"0123456789")
+
+    def test_validator_change_discards_segments(self):
+        ev = [
+            origin("o1", 0, url="/f", body="0123456789", etag='"v1"',
+                   headers={"cache-control": "max-age=5"}),
+            rreq("r1", 1, rng="bytes=0-4"),
+            {"id": "ch", "type": "origin_change", "at": 10, "url": "/f",
+             "body": "XXXXXXXXXX", "etag": '"v2"'},
+            rreq("r2", 11, rng="bytes=0-4"),
+        ]
+        eng, res = run_events({}, ev)
+        self.assertEqual(res[1]["status"], 200)
+        self.assertEqual(res[1]["verdict"], REFRESHED)
+        self.assertEqual(body_of(res[1]), b"X" * 10)
+        self.assertGreaterEqual(eng.state["counters"]["segments_invalidated"], 1)
+
+    def test_stale_covered_range_revalidates_to_206(self):
+        ev = [
+            origin("o1", 0, url="/f", body="0123456789", etag='"v1"',
+                   headers={"cache-control": "max-age=5"}),
+            rreq("r1", 1, rng="bytes=0-9"),
+            rreq("r2", 20, rng="bytes=2-7"),
+        ]
+        _, res = run_events({}, ev)
+        self.assertEqual(res[1]["verdict"], REVALIDATED)
+        self.assertEqual(res[1]["status"], 206)
+        self.assertEqual(body_of(res[1]), b"234567")
+
+    def test_weak_etag_segments_not_stored(self):
+        ev = [
+            origin("o1", 0, url="/f", body="0123456789", etag='W/"v1"',
+                   headers={"cache-control": "max-age=1000"}),
+            rreq("r1", 1, rng="bytes=0-4"),
+            rreq("r2", 2, rng="bytes=0-4"),
+        ]
+        eng, res = run_events({}, ev)
+        self.assertTrue(res[1]["from_origin"])  # 未存片段，再次回源
+        self.assertNotIn("GET /f", eng.state["cache"])
+
+    def test_range_cache_disabled_passes_through(self):
+        ev = [
+            origin("o1", 0, url="/f", body="0123456789", etag='"v"',
+                   headers={"cache-control": "max-age=1000"}),
+            rreq("r1", 1, rng="bytes=0-4"),
+            rreq("r2", 2, rng="bytes=0-4"),
+        ]
+        eng, res = run_events({"range_cache": False}, ev)
+        self.assertTrue(all(r["from_origin"] for r in res))
+        self.assertNotIn("GET /f", eng.state["cache"])
+
+
 class StoreTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
@@ -470,6 +718,39 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(ca["origin_fetches"], 3)
         self.assertEqual(cb["origin_fetches"], 1)
         self.assertGreater(ca["bytes_from_origin"], cb["bytes_from_origin"])
+
+    def test_range_segments_persist_across_restart(self):
+        import base64
+        sc = self.store.create_scenario("range-persist")
+        sid = sc["id"]
+        data = bytes(range(20))
+        self.store.add_events(sid, [
+            origin_b64("o", 0, data=data, etag='"v"',
+                       headers={"cache-control": "max-age=1000"}),
+            rreq("r1", 1, url="/bin", rng="bytes=0-9"),
+        ])
+        out = self.store.run(sid)
+        self.assertEqual([r["verdict"] for r in out["results"] if r["type"] == "request"],
+                         [RANGE_FILL])
+
+        # 重启：新 Store 打开同一库文件，分段状态必须恢复且可继续命中/补齐
+        self.store.close()
+        store2 = Store(self.tmp.name)
+        state = store2.get_state(sid)
+        variant = state["cache"]["GET /bin"]["variants"][0]
+        self.assertTrue(variant["partial"])
+        self.assertEqual(variant["length"], 20)
+        seg = variant["segments"][0]
+        self.assertEqual([seg["start"], seg["end"]], [0, 9])
+        self.assertEqual(seg["body"], data[0:10])  # bytes 经 base64 无损往返
+        self.assertEqual(state["counters"]["range_bytes_from_origin"], 10)
+
+        store2.add_event(sid, rreq("r2", 2, url="/bin", rng="bytes=0-9"))
+        out = store2.run(sid)
+        verdicts = [r["verdict"] for r in out["results"] if r["type"] == "request"]
+        self.assertEqual(verdicts, [RANGE_HIT])
+        store2.close()
+        self.store = Store(self.tmp.name)
 
     def test_bad_event(self):
         sc = self.store.create_scenario("s3")

@@ -595,38 +595,39 @@ class Engine:
                     f"完整 GET 但缓存只有片段，缺口 {gaps}，回源补齐后返回完整 200"
                     if gaps else "完整 GET，片段覆盖完整表示但需重验证")
             elif want_range:
-                interval = resolve_range(range_spec, entry["length"])
-                if interval is None:
-                    # 相对已知表示长度不可满足：缓存可直接生成 416
-                    served = self._range_416(entry["length"])
-                    counters["unsatisfiable"] += 1
-                    log("RANGE_416",
-                        f"请求区间相对缓存长度 {entry['length']} 不可满足，返回 416（不回源）")
-                    return self._done(counters, served, UNSATISFIABLE, at, url, method,
-                                      req_headers, trace, entry, origin_used=False,
-                                      range_info={"requested": req_headers["range"],
-                                                  "length": entry["length"],
-                                                  "served_from": "cache"})
-
-                # 客户端 If-Range 与缓存验证器比较（只需判定一次）
+                # 先判定 If-Range：不匹配时（即便区间越界）按 RFC 7233 忽略 Range，
+                # 走完整 GET 回源，绝不能先由缓存生成 416
                 ir = None
                 if if_range is not None:
                     ir = self._if_range_matches(if_range, entry["headers"])
                     if ir is False:
                         log("IF_RANGE_MISMATCH",
                             f"If-Range {if_range} 与缓存验证器不一致，"
-                            "忽略 Range 回源请求完整表示")
+                            "忽略 Range（不判定区间是否越界）回源请求完整表示")
                     elif ir:
                         log("IF_RANGE_MATCH",
                             f"If-Range {if_range} 与缓存验证器一致，按区间处理")
                     else:
                         log("IF_RANGE_UNKNOWN", "缓存无可用验证器，If-Range 交源站判定")
 
-                # 明确不匹配：直接走完整 GET 路径（剥离 Range）
                 if ir is False:
+                    # 明确不匹配：直接走完整 GET 路径（剥离 Range）
                     force_full_get = True
                     want_range = False
                 else:
+                    interval = resolve_range(range_spec, entry["length"])
+                    if interval is None:
+                        # 相对已知表示长度不可满足：缓存可直接生成 416
+                        served = self._range_416(entry["length"])
+                        counters["unsatisfiable"] += 1
+                        log("RANGE_416",
+                            f"请求区间相对缓存长度 {entry['length']} 不可满足，返回 416（不回源）")
+                        return self._done(counters, served, UNSATISFIABLE, at, url, method,
+                                          req_headers, trace, entry, origin_used=False,
+                                          range_info={"requested": req_headers["range"],
+                                                      "length": entry["length"],
+                                                      "served_from": "cache"})
+
                     covered, gaps = self._coverage(entry, *interval)
                     rinfo_base = {"requested": req_headers["range"], "first": interval[0],
                                   "last": interval[1], "length": entry["length"],
@@ -948,8 +949,9 @@ class Engine:
             elif entry["headers"].get("last-modified"):
                 validator_header = ("if-range", entry["headers"]["last-modified"])
 
-        # 逐段回源补齐（每个缺口是一个单区间请求）
+        # 逐段回源补齐（每个缺口是一个单区间请求）；同时累计本次实际回源字节
         fetched = []
+        origin_bytes_actual = 0
         for gi, (gs, ge) in enumerate(gaps):
             fwd = {k: v for k, v in req_headers.items()
                    if k not in ("range", "if-range", "if-none-match", "if-modified-since")}
@@ -963,6 +965,8 @@ class Engine:
                 + (f"，附带 {validator_header[0]}: {validator_header[1]}"
                    if validator_header else ""))
             st, hd, bd = self._fetch_origin(origin, fwd, at, trace)
+            wb = wire_size(st, hd, bd)
+            origin_bytes_actual += wb
             self._count_origin_response(counters, st, hd, bd, range_hdr=fwd["range"])
 
             if st == 200:
@@ -1024,28 +1028,33 @@ class Engine:
             served = self._entry_response(entry, age, at)
             rinfo = {**rinfo_base, "covered": covered, "gaps": gaps_after,
                      "fetched": fetched_ranges, "full_get": True,
+                     "origin_bytes": origin_bytes_actual,
+                     "origin_body_bytes": fetched_bytes,
                      "served_from": "cache+origin-fill",
                      "segments_after": segments_after}
             self._trace(trace, "RANGE_FILLED",
-                f"完整 GET 缺口补齐完成，本次回源 {fetched_bytes} 字节，"
-                f"合并后片段={segments_after}，返回完整 200")
+                f"完整 GET 缺口补齐完成，本次回源 {fetched_bytes} 正文节，"
+                f"线传输估算 {origin_bytes_actual} 字节，合并后片段={segments_after}，返回完整 200")
             return self._done(counters, served, RANGE_FILL, at, url, method,
                               req_headers, trace, entry, origin_used=True,
-                              origin_status=200, range_info=rinfo)
+                              origin_status=200, range_info=rinfo,
+                              origin_bytes=origin_bytes_actual)
 
         served, rinfo = self._serve_cached_range(entry, None, age, at, interval=interval)
         rinfo = {**rinfo_base,
                  "covered": covered, "gaps": gaps_after,
                  "fetched": fetched_ranges,
+                 "origin_bytes": origin_bytes_actual,
+                 "origin_body_bytes": fetched_bytes,
                  "served_from": "cache+origin-fill",
                  "segments_after": segments_after,
                  **rinfo}
         self._trace(trace, "RANGE_FILLED",
-            f"缺口补齐完成，本次回源 {fetched_bytes} 字节，"
-            f"合并后片段={segments_after}")
+            f"缺口补齐完成，本次回源 {fetched_bytes} 正文节，"
+            f"线传输估算 {origin_bytes_actual} 字节，合并后片段={segments_after}")
         return self._done(counters, served, RANGE_FILL, at, url, method,
                           req_headers, trace, entry, origin_used=True,
-                          range_info=rinfo)
+                          range_info=rinfo, origin_bytes=origin_bytes_actual)
 
     def _full_replaces_for_range(self, cache_key, resp, entry, url, method, at,
                                  req_headers, req_no_store, trace, counters,
@@ -1286,6 +1295,10 @@ class Engine:
                           "detail": f"写入分段缓存：[{fs},{fe}]/{flen}（{fe - fs + 1} 字节），"
                                     f"ttl={'None' if ttl is None else f'{ttl:.0f}s'} 验证器="
                                     f"{headers.get('etag') or headers.get('last-modified')}"})
+            # 单个 206 已覆盖完整表示：直接升级为完整条目（后续无 Range 的 GET 可返回 200）
+            if fs == 0 and fe == flen - 1:
+                self._promote_complete(entry, merged_segments=entry["segments"], at=at,
+                                       trace=trace)
             return {"stored": True, "entry": entry, "reason": None}
 
         # 与既有片段合并（验证器已确认一致）
@@ -1310,14 +1323,31 @@ class Engine:
                                 f"stored_at={existing['stored_at']:.0f} ttl={ttl_txt}"})
 
         if complete:
-            full = self._slice_segments(merged, 0, flen - 1)
-            existing["partial"] = False
-            existing["body"] = full
-            existing["status"] = 200
-            existing["segments"] = merged
-            trace.append({"step": len(trace) + 1, "code": "MERGE_COMPLETE",
-                          "detail": f"片段已拼满 [0,{flen - 1}]，升级为完整表示（{flen} 字节）"})
+            self._promote_complete(existing, merged_segments=merged, at=at, trace=trace)
         return {"stored": True, "entry": existing, "reason": None}
+
+    @staticmethod
+    def _promote_complete(entry, merged_segments, at, trace):
+        """片段已覆盖完整表示：升级为完整 200 条目。
+
+        必须清掉部分响应专属的 Content-Range，并把 Content-Length 更新为完整长度，
+        否则后续完整 GET 会错误地带着区间头返回。
+        """
+        flen = entry["length"]
+        full = Engine._slice_segments(merged_segments, 0, flen - 1)
+        entry["partial"] = False
+        entry["body"] = full
+        entry["status"] = 200
+        entry["segments"] = merged_segments
+        headers = dict(entry["headers"])
+        removed_cr = headers.pop("content-range", None)
+        headers["content-length"] = str(flen)
+        entry["headers"] = headers
+        trace.append({"step": len(trace) + 1, "code": "MERGE_COMPLETE",
+                      "detail": f"片段已拼满 [0,{flen - 1}]，升级为完整表示（{flen} 字节）；"
+                                + (f"移除残留 Content-Range（{removed_cr}），"
+                                   if removed_cr else "")
+                                + f"Content-Length 更新为 {flen}"})
 
     def _find_variant(self, cache_key, req_headers):
         bucket = self.state["cache"].get(cache_key)
@@ -1704,7 +1734,7 @@ class Engine:
 
     def _done(self, counters, served, verdict, at, url, method, req_headers,
               trace, entry, origin_used, origin_status=None, origin_resp=None,
-              range_info=None):
+              range_info=None, origin_bytes=None):
         served_body = served.get("body", b"")
         counters["bytes_served"] += wire_size(
             served["status"], served["headers"], served_body)
@@ -1735,9 +1765,10 @@ class Engine:
             if isinstance(served_body, bytes) else to_b64(str(served_body).encode("utf-8")),
             "bytes_served": wire_size(
                 served["status"], served["headers"], served_body),
-            "origin_bytes": (wire_size(origin_resp["status"], origin_resp["headers"],
-                                       origin_resp.get("body"))
-                             if origin_resp is not None else 0),
+            "origin_bytes": (origin_bytes if origin_bytes is not None
+                             else (wire_size(origin_resp["status"], origin_resp["headers"],
+                                             origin_resp.get("body"))
+                                   if origin_resp is not None else 0)),
             "cache_entry_after": self._entry_summary(entry),
             "network_up": self.state["network_up"],
             "trace": trace,
